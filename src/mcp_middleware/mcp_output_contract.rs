@@ -84,7 +84,7 @@ pub fn build_ping_response(id: i64) -> String {
     result
 }
 
-fn build(json: JsonObjectWriter, id: i64) -> String {
+pub fn build(json: JsonObjectWriter, id: i64) -> String {
     let mut result = "data: ".to_string();
     json.write("jsonrpc", "2.0")
         .write("id", id)
