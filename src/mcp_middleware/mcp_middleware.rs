@@ -224,6 +224,8 @@ fn send_error_response_as_stream(
     now: DateTimeAsMicroseconds,
 ) -> Result<HttpOkResult, HttpFailResult> {
     let mut response = my_json::json_writer::JsonObjectWriter::new()
+        .write("jsonrpc", "2.0")
+        .write("id", id)
         .write("type", "error")
         .write("code", 500)
         .write("details", error_mgs)
@@ -233,6 +235,7 @@ fn send_error_response_as_stream(
     response.push('\n');
     response.push('\n');
 
+    println!("Response: {:?}", response);
     send_response_as_stream(response, session_id, now)
 }
 
