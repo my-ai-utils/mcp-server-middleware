@@ -6,11 +6,12 @@ The middleware provides a flexible, trait-based architecture that allows you to 
 
 ## Features
 
-- **MCP Protocol Support**: Full implementation of MCP protocol including initialization, tool calls, and notifications
-- **Session Management**: Automatic session creation and management with session-based authentication
-- **Tool Call Framework**: Easy-to-use trait-based system for implementing custom tool calls
-- **HTTP Integration**: Seamless integration with `my-http-server` as middleware
-- **Type-Safe Tool Definitions**: Leverages `my-ai-agent` for type-safe JSON schema generation
+* **MCP Protocol Support**: Full implementation of MCP protocol including initialization, tool calls, and notifications
+* **Session Management**: Automatic session creation and management with session-based authentication
+* **Tool Call Framework**: Easy-to-use trait-based system for implementing custom tool calls
+* **HTTP Integration**: Seamless integration with `my-http-server` as middleware
+* **Type-Safe Tool Definitions**: Leverages `my-ai-agent` for type-safe JSON schema generation
+* **Dynamic Enumeration**: Support for dynamically generated enum values based on runtime data
 
 ## Installation
 
@@ -114,6 +115,48 @@ http_server.add_middleware(mcp_middleware);
 http_server.start(app_states, logger);
 ```
 
+## Dynamic Enum Fields
+
+For tool call parameters that need to accept values from a dynamically generated list (such as filtering by available cities, countries, or other runtime-determined options), you can use dynamic enumeration. This feature allows enum values to be generated at runtime based on your application's current data state.
+
+To use dynamic enums, specify the `enum` parameter in the `#[property]` attribute with the name of an async function that will generate the enum values. This function must return `Option<Vec<StrOrString<'static>>>` and will be called automatically when the MCP client requests the tool schema.
+
+```rust
+use my_ai_agent::macros::ApplyJsonSchema;
+use serde::{Deserialize, Serialize};
+use service_sdk::rust_extensions::StrOrString;
+
+#[derive(ApplyJsonSchema, Serialize, Deserialize, Debug)]
+pub struct FilterPropertiesToolCallModel {
+    #[property(enum: "get_city_enum", description: "Filter properties by city location")]
+    pub city: Option<String>,
+
+    #[property(enum: "get_country_enum", description: "Filter by country using ISO2 code")]
+    pub country: Option<String>,
+
+    #[property(enum: "get_project_name_enum", description: "Filter by development project name")]
+    pub project_name: Option<String>,
+}
+
+// Implement the enum generation functions
+async fn get_city_enum() -> Option<Vec<StrOrString<'static>>> {
+    let data_access = DATA_HOLDER.read().await;
+    data_access.units.group_by_project(|unit| &unit.city)
+}
+
+async fn get_country_enum() -> Option<Vec<StrOrString<'static>>> {
+    let data_access = DATA_HOLDER.read().await;
+    data_access.units.group_by_project(|unit| &unit.country)
+}
+
+async fn get_project_name_enum() -> Option<Vec<StrOrString<'static>>> {
+    let data_access = DATA_HOLDER.read().await;
+    data_access.units.group_by_project(|project| &project.title)
+}
+```
+
+The enum functions are automatically discovered and called when generating the JSON schema for your tool. The returned values will be included in the tool's input schema as enum constraints, providing clients with the available options for each parameter. This is particularly useful for parameters that depend on your application's current state, such as filtering by available cities, selecting from active projects, or choosing from dynamically loaded configuration options.
+
 ## Complete Example: Postgres MCP Server
 
 The following example demonstrates a real-world implementation - a Postgres MCP server that allows AI agents to execute SQL queries. This serves as a concrete reference for building your own MCP servers:
@@ -195,17 +238,18 @@ The main middleware struct that handles MCP protocol communication.
 
 Creates a new middleware instance.
 
-- `path`: The HTTP path where MCP requests will be handled (e.g., `/mcp`, `/api/mcp`)
-- `name`: Server name displayed to clients
-- `version`: Server version string
-- `instructions`: Instructions for the AI agent using this server
+* `path`: The HTTP path where MCP requests will be handled (e.g., `/mcp`, `/api/mcp`)
+* `name`: Server name displayed to clients
+* `version`: Server version string
+* `instructions`: Instructions for the AI agent using this server
 
 #### `register_tool_call(service)`
 
 Registers a tool call service. The service must implement:
-- `McpService<InputData, OutputData>` trait
-- `ToolDefinition` trait
-- Input and output types must implement `JsonTypeDescription`, `Serialize`, and `DeserializeOwned`
+
+* `McpService<InputData, OutputData>` trait
+* `ToolDefinition` trait
+* Input and output types must implement `JsonTypeDescription`, `Serialize`, and `DeserializeOwned`
 
 ### `McpService` Trait
 
@@ -237,21 +281,21 @@ pub trait ToolDefinition {
 
 The middleware handles the following MCP protocol methods:
 
-- **`initialize`**: Initializes a new MCP session and returns server capabilities
-- **`tools/list`**: Returns a list of available tools with their schemas
-- **`tools/call`**: Executes a tool call with the provided arguments
-- **`ping`**: Health check endpoint
-- **`resources/list`**: Returns available resources (currently returns empty)
-- **`notifications/initialized`**: Handles initialization notifications
+* **`initialize`**: Initializes a new MCP session and returns server capabilities
+* **`tools/list`**: Returns a list of available tools with their schemas
+* **`tools/call`**: Executes a tool call with the provided arguments
+* **`ping`**: Health check endpoint
+* **`resources/list`**: Returns available resources (currently returns empty)
+* **`notifications/initialized`**: Handles initialization notifications
 
 ## Session Management
 
 Sessions are automatically managed by the middleware:
 
-- Each `initialize` request creates a new session with a unique session ID
-- Session IDs are returned in the `mcp-session-id` HTTP header
-- Subsequent requests must include the session ID in the `mcp-session-id` header
-- GET requests to the MCP path establish Server-Sent Events (SSE) streams for notifications
+* Each `initialize` request creates a new session with a unique session ID
+* Session IDs are returned in the `mcp-session-id` HTTP header
+* Subsequent requests must include the session ID in the `mcp-session-id` header
+* GET requests to the MCP path establish Server-Sent Events (SSE) streams for notifications
 
 ## Type Safety
 
@@ -275,21 +319,21 @@ Tool execution errors should be returned as `Err(String)` from `execute_tool_cal
 
 This middleware can be used to build MCP servers for various purposes:
 
-- **Database Access**: Expose database operations (SQL queries, schema inspection, etc.)
-- **File System Operations**: Provide file and directory management capabilities
-- **API Integrations**: Wrap external APIs and services as MCP tools
-- **Development Tools**: Expose build, test, and deployment operations
-- **Custom Business Logic**: Implement domain-specific tools for your application
+* **Database Access**: Expose database operations (SQL queries, schema inspection, etc.)
+* **File System Operations**: Provide file and directory management capabilities
+* **API Integrations**: Wrap external APIs and services as MCP tools
+* **Development Tools**: Expose build, test, and deployment operations
+* **Custom Business Logic**: Implement domain-specific tools for your application
 
 The Postgres example above demonstrates one such use case. You can adapt the same pattern to implement tools for any functionality you need.
 
 ## Dependencies
 
-- `my-http-server`: HTTP server framework
-- `my-ai-agent`: AI agent utilities and JSON schema generation
-- `tokio`: Async runtime
-- `serde` / `serde_json`: Serialization
-- `async-trait`: Async trait support
+* `my-http-server`: HTTP server framework
+* `my-ai-agent`: AI agent utilities and JSON schema generation
+* `tokio`: Async runtime
+* `serde` / `serde_json`: Serialization
+* `async-trait`: Async trait support
 
 ## License
 
