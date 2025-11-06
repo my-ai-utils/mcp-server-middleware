@@ -223,12 +223,15 @@ fn send_error_response_as_stream(
     id: i64,
     now: DateTimeAsMicroseconds,
 ) -> Result<HttpOkResult, HttpFailResult> {
-    let object_writer = my_json::json_writer::JsonObjectWriter::new()
+    let mut response = my_json::json_writer::JsonObjectWriter::new()
         .write("type", "error")
         .write("code", 500)
-        .write("details", error_mgs);
+        .write("details", error_mgs)
+        .build();
 
-    let response = super::mcp_output_contract::build(object_writer, id);
+    response.insert_str(0, "data: ");
+    response.push('\n');
+    response.push('\n');
 
     send_response_as_stream(response, session_id, now)
 }
