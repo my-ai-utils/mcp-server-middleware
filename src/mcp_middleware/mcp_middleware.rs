@@ -98,7 +98,7 @@ impl McpMiddleware {
                     Ok(response) => {
                         let response =
                             super::mcp_output_contract::compile_execute_tool_call_response(
-                                response, id,
+                                response, id, false,
                             );
                         return send_response_as_stream(response, session_id, now);
                     }
@@ -107,13 +107,12 @@ impl McpMiddleware {
                             "Error executing {} with params {}. Err: {}",
                             params.name, arguments, err
                         );
+                        let response =
+                            super::mcp_output_contract::compile_execute_tool_call_response(
+                                err, id, true,
+                            );
 
-                        return send_error_response_as_stream(
-                            err,
-                            session_id,
-                            id,
-                            DateTimeAsMicroseconds::now(),
-                        );
+                        return send_response_as_stream(response, session_id, now);
                     }
                 }
             }

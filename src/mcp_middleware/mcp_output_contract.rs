@@ -47,7 +47,7 @@ pub fn compile_tool_calls(tools: Vec<ToolCallSchemaData>, id: i64) -> String {
     build(json_builder, id)
 }
 
-pub fn compile_execute_tool_call_response(response: String, id: i64) -> String {
+pub fn compile_execute_tool_call_response(response: String, id: i64, is_error: bool) -> String {
     let mut result = JsonObjectWriter::new()
         .write("jsonrpc", "2.0")
         .write("id", id)
@@ -59,7 +59,7 @@ pub fn compile_execute_tool_call_response(response: String, id: i64) -> String {
                     })
                 })
                 .write("structuredContent", RawJsonObject::AsStr(&response))
-                .write("isError", false)
+                .write("isError", is_error)
         })
         .build();
 
