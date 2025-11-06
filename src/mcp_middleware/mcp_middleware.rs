@@ -103,10 +103,12 @@ impl McpMiddleware {
                         return send_response_as_stream(response, session_id, now);
                     }
                     Err(err) => {
-                        panic!(
+                        println!(
                             "Error executing {} with params {}. Err: {}",
                             params.name, arguments, err
                         );
+
+                        return HttpFailResult::as_fatal_error(err).into_err();
                     }
                 }
             }
