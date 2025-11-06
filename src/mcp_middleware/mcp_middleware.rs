@@ -8,7 +8,7 @@ use crate::mcp_middleware::{
     McpInputPayload, McpService, McpSessions, McpToolCalls, SESSION_HEADER, ToolCallExecutor,
 };
 
-use my_ai_agent::{ToolDefinition, json_schema::*};
+use my_ai_agent::{ToolDefinition, json_schema::*, my_json};
 
 pub struct McpMiddleware {
     mpc_path: &'static str,
@@ -108,7 +108,11 @@ impl McpMiddleware {
                             params.name, arguments, err
                         );
 
-                        return HttpFailResult::as_fatal_error(err).into_err();
+                        return send_error_response_as_stream(
+                            err,
+                            session_id,
+                            DateTimeAsMicroseconds::now(),
+                        );
                     }
                 }
             }
@@ -211,6 +215,21 @@ fn send_response(response: String) -> Result<HttpOkResult, HttpFailResult> {
     .into_ok_result(false)
 }
      */
+
+fn send_error_response_as_stream(
+    error_mgs: String,
+    session_id: &str,
+    now: DateTimeAsMicroseconds,
+) -> Result<HttpOkResult, HttpFailResult> {
+    let response = my_json::json_writer::JsonObjectWriter::new()
+        .write("type", "error")
+        .write("code", 500)
+        .write("details", error_mgs)
+        .build();
+
+    send_response_as_stream(response, session_id, now)
+}
+
 fn send_response_as_stream(
     response: String,
     session_id: &str,
