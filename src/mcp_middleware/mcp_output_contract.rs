@@ -58,7 +58,11 @@ pub fn compile_execute_tool_call_response(response: String, id: i64, is_error: b
                         obj.write("type", "text").write("text", response.as_str())
                     })
                 })
-                .write("structuredContent", RawJsonObject::AsStr(&response))
+                .write_if(
+                    "structuredContent",
+                    RawJsonObject::AsStr(&response),
+                    !is_error,
+                )
                 .write("isError", is_error)
         })
         .build();
