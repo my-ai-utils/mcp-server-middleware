@@ -48,4 +48,8 @@ impl McpToolCalls {
 
         result
     }
+
+    pub fn has_tools(&self) -> bool {
+        !self.tool_calls.is_empty()
+    }
 }

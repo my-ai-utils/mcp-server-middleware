@@ -10,6 +10,8 @@ pub fn compile_init_response(
     instructions: &str,
     protocol_version: &str,
     id: i64,
+    has_tools: bool,
+    has_resources: bool,
     has_prompts: bool,
 ) -> String {
     let json_builder =
@@ -17,11 +19,13 @@ pub fn compile_init_response(
             result
                 .write("protocolVersion", protocol_version)
                 .write_json_object("capabilities", |cap| {
-                    cap.write_json_object("resources", |res| res.write("listChanged", true))
-                        .write_json_object("tools", |res| res.write("listChanged", true))
-                        .write_json_object_if("prompts", has_prompts, |res| {
-                            res.write("listChanged", true)
-                        })
+                    cap.write_json_object_if("resources", has_resources, |res| {
+                        res.write("listChanged", true)
+                    })
+                    .write_json_object_if("tools", has_tools, |res| res.write("listChanged", true))
+                    .write_json_object_if("prompts", has_prompts, |res| {
+                        res.write("listChanged", true)
+                    })
                 })
                 .write_json_object("serverInfo", |server_info| {
                     server_info.write("name", name).write("version", version)

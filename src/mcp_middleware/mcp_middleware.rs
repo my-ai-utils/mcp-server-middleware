@@ -91,6 +91,8 @@ impl McpMiddleware {
                     &self.instructions,
                     &contract.protocol_version,
                     id,
+                    self.tool_calls.has_tools(),
+                    false,
                     self.prompts.has_prompts(),
                 );
 
@@ -232,6 +234,8 @@ impl McpMiddleware {
                     &self.instructions,
                     &contract.protocol_version,
                     id,
+                    self.tool_calls.has_tools(),
+                    false,
                     self.prompts.has_prompts(),
                 );
 
