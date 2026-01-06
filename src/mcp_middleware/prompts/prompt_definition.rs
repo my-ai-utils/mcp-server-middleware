@@ -4,9 +4,9 @@ pub trait PromptDefinition {
     const DESCRIPTION: &'static str;
 }
 
-/// Represents a prompt argument in the MCP protocol
+/// Represents a prompt argument description in the MCP protocol
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct PromptArgument {
+pub struct PromptArgumentDescription {
     pub name: String,
     pub description: String,
     #[serde(default)]

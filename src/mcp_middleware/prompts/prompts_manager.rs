@@ -1,11 +1,9 @@
-use my_ai_agent::my_json;
-
 use super::*;
 use std::{collections::BTreeMap, sync::Arc};
 
 pub struct PromptSchemaData {
     pub prompt: Arc<dyn McpPromptAbstract + Send + Sync + 'static>,
-    pub input: my_json::json_writer::JsonObjectWriter,
+    pub argument_descriptions: Vec<PromptArgumentDescription>,
 }
 
 pub struct McpPrompts {
@@ -36,16 +34,19 @@ impl McpPrompts {
         let mut result = Vec::with_capacity(self.prompts.len());
 
         for prompt in self.prompts.values() {
-            let input = prompt.get_input_params().await;
+            let argument_descriptions = prompt.get_argument_descriptions().await;
+
             result.push(PromptSchemaData {
                 prompt: prompt.clone(),
-                input,
+                argument_descriptions,
             });
         }
 
         result
     }
+}
 
+impl McpPrompts {
     pub fn get(&self, name: &str) -> Option<Arc<dyn McpPromptAbstract + Send + Sync + 'static>> {
         self.prompts.get(name).map(|p| p.clone())
     }

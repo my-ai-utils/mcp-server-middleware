@@ -59,15 +59,16 @@ impl McpMiddleware {
     }
 
     pub async fn register_prompt<
-        InputData: JsonTypeDescription + Sized + Send + Sync + 'static + Serialize + DeserializeOwned,
-        TMcpPromptService: McpPromptService<InputData> + Send + Sync + 'static + PromptDefinition,
+        TMcpPromptService: McpPromptService + Send + Sync + 'static + PromptDefinition,
     >(
         &mut self,
         service: Arc<TMcpPromptService>,
+        argument_descriptions: Vec<super::PromptArgumentDescription>,
     ) {
-        let executor: PromptExecutor<InputData> = PromptExecutor {
+        let executor = PromptExecutor {
             prompt_name: TMcpPromptService::PROMPT_NAME,
             description: TMcpPromptService::DESCRIPTION,
+            argument_descriptions,
             holder: service,
         };
 
