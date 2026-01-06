@@ -79,7 +79,7 @@ pub fn compile_prompts_list(prompts: Vec<super::PromptSchemaData>, id: i64) -> S
     build(json_builder, id)
 }
 
-pub fn compile_get_prompt_response(response: String, id: i64, is_error: bool) -> String {
+pub fn compile_get_prompt_response(response: String, id: i64) -> String {
     let mut result = JsonObjectWriter::new()
         .write("jsonrpc", "2.0")
         .write("id", id)
@@ -96,22 +96,12 @@ pub fn compile_get_prompt_response(response: String, id: i64, is_error: bool) ->
                             })
                     })
                 })
-                .write_if(
-                    "structuredContent",
-                    RawJsonObject::AsStr(&response),
-                    !is_error,
-                )
-                .write("isError", is_error)
         })
         .build();
 
     result.insert_str(0, "data: ");
     result.push('\n');
     result.push('\n');
-
-    println!("-----");
-    println!("{}", result);
-    println!("-----");
 
     result
 }

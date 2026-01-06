@@ -9,7 +9,7 @@ use crate::mcp_middleware::{
     PromptDefinition, PromptExecutor, SESSION_HEADER, ToolCallExecutor,
 };
 
-use my_ai_agent::{ToolDefinition, json_schema::*, my_json};
+use my_ai_agent::{ToolDefinition, json_schema::*};
 
 pub struct McpMiddleware {
     mpc_path: &'static str,
@@ -161,9 +161,8 @@ impl McpMiddleware {
 
                 match self.prompts.execute(&params.name, &arguments).await {
                     Ok(response) => {
-                        let response = super::mcp_output_contract::compile_get_prompt_response(
-                            response, id, false,
-                        );
+                        let response =
+                            super::mcp_output_contract::compile_get_prompt_response(response, id);
                         return send_response_as_stream(response, session_id, now);
                     }
                     Err(err) => {
@@ -171,10 +170,8 @@ impl McpMiddleware {
                             "Error executing prompt {} with params {:?}. Err: {}",
                             params.name, arguments, err
                         );
-                        let response =
-                            super::mcp_output_contract::compile_get_prompt_response(err, id, true);
 
-                        return send_response_as_stream(response, session_id, now);
+                        return send_error_response_as_stream(err, session_id, id, now);
                     }
                 }
             }
@@ -272,14 +269,13 @@ fn send_response(response: String) -> Result<HttpOkResult, HttpFailResult> {
 }
      */
 
-/*
 fn send_error_response_as_stream(
     error_mgs: String,
     session_id: &str,
     id: i64,
     now: DateTimeAsMicroseconds,
 ) -> Result<HttpOkResult, HttpFailResult> {
-    let mut response = my_json::json_writer::JsonObjectWriter::new()
+    let mut response = my_ai_agent::my_json::json_writer::JsonObjectWriter::new()
         .write("jsonrpc", "2.0")
         .write("id", id)
         .write("type", "error")
@@ -294,7 +290,6 @@ fn send_error_response_as_stream(
     println!("Response: {:?}", response);
     send_response_as_stream(response, session_id, now)
 }
-     */
 
 fn send_response_as_stream(
     response: String,
