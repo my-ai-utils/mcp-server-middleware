@@ -5,8 +5,9 @@ use rust_extensions::date_time::DateTimeAsMicroseconds;
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::mcp_middleware::{
-    McpInputPayload, McpPromptService, McpPrompts, McpSessions, McpToolCall, McpToolCalls,
-    PromptDefinition, PromptExecutor, SESSION_HEADER, ToolCallExecutor,
+    McpInputPayload, McpPromptService, McpPrompts, McpResourceService, McpResources, McpSessions,
+    McpToolCall, McpToolCalls, PromptDefinition, PromptExecutor, ResourceDefinition,
+    ResourceExecutor, SESSION_HEADER, ToolCallExecutor,
 };
 
 use my_ai_agent::{ToolDefinition, json_schema::*};
@@ -19,6 +20,7 @@ pub struct McpMiddleware {
     sessions: McpSessions,
     tool_calls: McpToolCalls,
     prompts: McpPrompts,
+    resources: McpResources,
 }
 
 impl McpMiddleware {
@@ -36,6 +38,7 @@ impl McpMiddleware {
             sessions: McpSessions::new(),
             tool_calls: McpToolCalls::new(),
             prompts: McpPrompts::new(),
+            resources: McpResources::new(),
         }
     }
 
@@ -74,6 +77,31 @@ impl McpMiddleware {
         self.prompts.add(Arc::new(executor));
     }
 
+    pub async fn register_resource<
+        TMcpResourceService: McpResourceService + Send + Sync + 'static + ResourceDefinition,
+    >(
+        &mut self,
+        service: Arc<TMcpResourceService>,
+    ) {
+        // Extract optional values before moving service - convert to owned values
+        let title = service.get_title().map(|s| s.to_string());
+        let size = service.get_size();
+        let icons = service.get_icons();
+
+        let executor = ResourceExecutor {
+            resource_uri: TMcpResourceService::RESOURCE_URI,
+            resource_name: TMcpResourceService::RESOURCE_NAME,
+            description: TMcpResourceService::DESCRIPTION,
+            mime_type: TMcpResourceService::MIME_TYPE,
+            title,
+            size,
+            icons,
+            holder: service,
+        };
+
+        self.resources.add(Arc::new(executor));
+    }
+
     async fn handle_authorized_request(
         &self,
         session_id: &str,
@@ -92,7 +120,7 @@ impl McpMiddleware {
                     &contract.protocol_version,
                     id,
                     self.tool_calls.has_tools(),
-                    false,
+                    self.resources.has_resources(),
                     self.prompts.has_prompts(),
                 );
 
@@ -104,8 +132,35 @@ impl McpMiddleware {
                 return send_response_as_stream(response, session_id.as_str(), now);
             }
 
-            super::McpInputData::ResourcesList => {
-                return HttpOutput::Empty.into_ok_result(false);
+            super::McpInputData::ResourcesList(_params) => {
+                let list = self.resources.get_list().await;
+                // TODO: Implement pagination logic based on cursor
+                let next_cursor = None; // For now, no pagination
+                let response =
+                    super::mcp_output_contract::compile_resources_list(list, id, next_cursor);
+
+                return send_response_as_stream(response, session_id, now);
+            }
+
+            super::McpInputData::ReadResource(params) => {
+                println!("Reading resource with URI: {:?}", params.uri);
+
+                match self.resources.read(&params.uri).await {
+                    Ok(response) => {
+                        let response = super::mcp_output_contract::compile_read_resource_response(
+                            response, id,
+                        );
+                        return send_response_as_stream(response, session_id, now);
+                    }
+                    Err(err) => {
+                        println!(
+                            "Error reading resource {} with URI {}. Err: {}",
+                            params.uri, params.uri, err
+                        );
+
+                        return send_error_response_as_stream(err, session_id, id, now);
+                    }
+                }
             }
 
             super::McpInputData::Ping => {
@@ -235,7 +290,7 @@ impl McpMiddleware {
                     &contract.protocol_version,
                     id,
                     self.tool_calls.has_tools(),
-                    false,
+                    self.resources.has_resources(),
                     self.prompts.has_prompts(),
                 );
 

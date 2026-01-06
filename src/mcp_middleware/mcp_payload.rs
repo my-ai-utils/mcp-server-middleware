@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug)]
 pub enum McpInputData {
     Initialize(InitializeMpcContract),
-    ResourcesList,
+    ResourcesList(ResourcesListModel),
+    ReadResource(ReadResourceModel),
     NotificationsInitialize,
     ToolsList,
     PromptsList,
@@ -23,7 +24,34 @@ impl McpInputData {
                 Self::Initialize(params)
             }
             "notifications/initialized" => Self::NotificationsInitialize,
-            "resources/list" => Self::ResourcesList,
+            "resources/list" => {
+                let model: Result<ResourcesListModel, serde_json::Error> =
+                    serde_json::from_str(&params);
+                match model {
+                    Ok(model) => {
+                        return Self::ResourcesList(model);
+                    }
+                    Err(_) => {
+                        // If params is empty or invalid, use default (no cursor)
+                        return Self::ResourcesList(ResourcesListModel { cursor: None });
+                    }
+                }
+            }
+            "resources/read" => {
+                let model: Result<ReadResourceModel, serde_json::Error> =
+                    serde_json::from_str(&params);
+                match model {
+                    Ok(model) => {
+                        return Self::ReadResource(model);
+                    }
+                    Err(err) => {
+                        panic!(
+                            "Can not deserialize read resource data: {}. Err: {:?}",
+                            params, err
+                        );
+                    }
+                }
+            }
             "tools/list" => Self::ToolsList,
             "prompts/list" => Self::PromptsList,
             "prompts/get" => {
@@ -75,6 +103,16 @@ pub struct ExecuteToolCallModel {
 pub struct GetPromptModel {
     pub name: String,
     pub arguments: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ResourcesListModel {
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReadResourceModel {
+    pub uri: String,
 }
 
 #[derive(Debug)]

@@ -12,5 +12,7 @@ mod tool_calls;
 pub use tool_calls::*;
 mod prompts;
 pub use prompts::*;
+mod resources;
+pub use resources::*;
 
 pub const SESSION_HEADER: &'static str = "mcp-session-id";
