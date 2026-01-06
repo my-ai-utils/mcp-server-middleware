@@ -152,9 +152,11 @@ impl McpMiddleware {
             }
 
             super::McpInputData::GetPrompt(params) => {
+                println!("Getting prompts with params: {:?}", params);
+
                 let arguments = match params.arguments {
-                    Some(args) => serde_json::to_string(&args).unwrap(),
-                    None => "{}".to_string(),
+                    Some(args) => args,
+                    None => Default::default(),
                 };
 
                 match self.prompts.execute(&params.name, &arguments).await {
@@ -166,7 +168,7 @@ impl McpMiddleware {
                     }
                     Err(err) => {
                         println!(
-                            "Error executing prompt {} with params {}. Err: {}",
+                            "Error executing prompt {} with params {:?}. Err: {}",
                             params.name, arguments, err
                         );
                         let response =

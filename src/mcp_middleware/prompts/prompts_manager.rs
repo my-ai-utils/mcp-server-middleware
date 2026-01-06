@@ -1,5 +1,8 @@
 use super::*;
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 pub struct PromptSchemaData {
     pub prompt: Arc<dyn McpPromptAbstract + Send + Sync + 'static>,
@@ -22,7 +25,11 @@ impl McpPrompts {
         self.prompts.insert(name, executor);
     }
 
-    pub async fn execute(&self, prompt_name: &str, input: &str) -> Result<String, String> {
+    pub async fn execute(
+        &self,
+        prompt_name: &str,
+        input: &HashMap<String, String>,
+    ) -> Result<String, String> {
         if let Some(executor) = self.prompts.get(prompt_name) {
             return executor.execute(input).await;
         }

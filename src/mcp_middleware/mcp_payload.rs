@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use my_ai_agent::my_json::json_reader::JsonFirstLineIterator;
 use serde::{Deserialize, Serialize};
 #[derive(Debug)]
@@ -72,7 +74,7 @@ pub struct ExecuteToolCallModel {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetPromptModel {
     pub name: String,
-    pub arguments: Option<serde_json::Value>,
+    pub arguments: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug)]
