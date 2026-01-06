@@ -63,12 +63,11 @@ impl McpMiddleware {
     >(
         &mut self,
         service: Arc<TMcpPromptService>,
-        argument_descriptions: Vec<super::PromptArgumentDescription>,
     ) {
         let executor = PromptExecutor {
             prompt_name: TMcpPromptService::PROMPT_NAME,
             description: TMcpPromptService::DESCRIPTION,
-            argument_descriptions,
+            argument_descriptions: TMcpPromptService::get_argument_descriptions(),
             holder: service,
         };
 

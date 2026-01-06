@@ -2,6 +2,8 @@
 pub trait PromptDefinition {
     const PROMPT_NAME: &'static str;
     const DESCRIPTION: &'static str;
+
+    fn get_argument_descriptions() -> Vec<super::PromptArgumentDescription>;
 }
 
 /// Represents a prompt argument description in the MCP protocol
