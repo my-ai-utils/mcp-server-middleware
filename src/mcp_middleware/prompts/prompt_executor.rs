@@ -6,21 +6,19 @@ use serde::{Serialize, de::DeserializeOwned};
 use crate::mcp_middleware::*;
 use my_http_server::async_trait;
 
-pub struct PromptExecutor<InputData, OutputData>
+pub struct PromptExecutor<InputData>
 where
     InputData: JsonTypeDescription + Sized + Send + Sync + 'static,
-    OutputData: JsonTypeDescription + Sized + Send + Sync + 'static,
 {
     pub prompt_name: &'static str,
     pub description: &'static str,
-    pub holder: Arc<dyn McpPromptService<InputData, OutputData> + Send + Sync + 'static>,
+    pub holder: Arc<dyn McpPromptService<InputData> + Send + Sync + 'static>,
 }
 
 #[async_trait::async_trait]
-impl<InputData, OutputData> McpPromptAbstract for PromptExecutor<InputData, OutputData>
+impl<InputData> McpPromptAbstract for PromptExecutor<InputData>
 where
     InputData: JsonTypeDescription + Sized + Send + Sync + 'static + Serialize + DeserializeOwned,
-    OutputData: JsonTypeDescription + Sized + Send + Sync + 'static + Serialize + DeserializeOwned,
 {
     fn get_prompt_name(&self) -> &str {
         &self.prompt_name

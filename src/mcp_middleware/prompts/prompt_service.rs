@@ -3,12 +3,11 @@ use my_http_server::async_trait;
 
 /// Trait that must be implemented by prompt services to handle prompt execution
 #[async_trait::async_trait]
-pub trait McpPromptService<InputData, OutputData>
+pub trait McpPromptService<InputData>
 where
     InputData: JsonTypeDescription + Sized + Send + Sync + 'static,
-    OutputData: JsonTypeDescription + Sized + Send + Sync + 'static,
 {
-    async fn execute_prompt(&self, model: InputData) -> Result<OutputData, String>;
+    async fn execute_prompt(&self, model: InputData) -> Result<String, String>;
 }
 
 /// Abstract trait for prompt services (similar to McpServiceAbstract for tools)
