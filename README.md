@@ -4,12 +4,94 @@ A Rust middleware library for implementing Model Context Protocol (MCP) servers.
 
 The middleware provides a flexible, trait-based architecture that allows you to implement custom tool calls for any domain - whether it's database access, file operations, API integrations, or any other functionality you want to expose through the MCP protocol.
 
+## About Model Context Protocol (MCP)
+
+The Model Context Protocol (MCP) is a standardized protocol (specification version 2025-11-25) that enables AI applications to securely access external data sources and tools. MCP provides a unified interface for AI agents to interact with external systems, databases, APIs, and services.
+
+### Core Concepts
+
+MCP servers expose capabilities through three main mechanisms:
+
+1. **Tools**: Executable functions that AI agents can call to perform actions
+   - Examples: Execute SQL queries, read/write files, call REST APIs, run shell commands
+   - Each tool has a name, description, and JSON schema defining input/output types
+   - Tools are discovered via `tools/list` and executed via `tools/call`
+
+2. **Prompts**: Pre-configured prompt templates with variable substitution
+   - Help guide AI interactions with structured, reusable prompts
+   - Support required and optional arguments for customization
+   - Discovered via `prompts/list` and retrieved via `prompts/get` with arguments
+
+3. **Resources**: Data sources that AI agents can read for context
+   - Examples: Files, database schemas, documentation, configuration files
+   - Each resource has a URI, name, description, MIME type, and optional metadata
+   - Support pagination for large resource lists
+   - Discovered via `resources/list` and read via `resources/read`
+
+### Protocol Architecture
+
+**Transport Layer**: MCP uses JSON-RPC 2.0 over HTTP with Server-Sent Events (SSE) for streaming responses. This provides:
+- Standardized request/response format
+- Real-time streaming capabilities
+- Compatibility with existing HTTP infrastructure
+
+**Session Management**: 
+- Each client connection establishes a session via `initialize` request
+- Sessions are identified by unique session IDs returned in `mcp-session-id` header
+- Subsequent requests require the session ID for authentication
+- GET requests establish SSE streams for server-to-client notifications
+
+**Capability Discovery**:
+- Servers declare capabilities during initialization (tools, prompts, resources)
+- Clients discover available capabilities through list endpoints
+- Dynamic schema generation ensures clients always have up-to-date tool definitions
+
+**Error Handling**:
+- Standard JSON-RPC error codes (-32002 for resource not found, -32603 for internal errors)
+- Structured error responses with error codes, messages, and optional data
+
+### This Implementation
+
+This middleware (`mcp-server-middleware`) is a **Rust library** that provides a complete, production-ready implementation of the MCP protocol specification. It offers:
+
+**Trait-Based Architecture**:
+- `McpService<Input, Output>`: Trait for implementing tool execution logic
+- `ToolDefinition`: Trait for providing tool metadata (name, description)
+- `McpPromptService`: Trait for implementing prompt templates
+- `ResourceDefinition` & `McpResourceService`: Traits for resource management
+
+**Type Safety**:
+- Automatic JSON schema generation from Rust types using `ApplyJsonSchema` macro
+- Compile-time type checking ensures schemas match implementation
+- Support for dynamic enum values based on runtime data
+
+**Protocol Compliance**:
+- Full implementation of MCP protocol specification (2025-11-25)
+- All required protocol methods (`initialize`, `tools/list`, `tools/call`, `prompts/list`, `prompts/get`, `resources/list`, `resources/read`, `ping`)
+- Proper JSON-RPC 2.0 formatting
+- SSE streaming support
+- Session management with secure session IDs
+
+**Integration**:
+- Seamless integration with `my-http-server` as HTTP middleware
+- Easy registration of tools, prompts, and resources
+- Automatic handling of protocol details (session management, error formatting, schema generation)
+
+**Key Features**:
+- Zero-boilerplate tool registration - just implement traits and register
+- Automatic schema generation - no manual JSON schema writing
+- Session-based security - each client gets isolated session
+- Streaming support - real-time updates via SSE
+- Resource pagination - efficient handling of large resource lists
+- Prompt templates - reusable prompts with variable substitution
+
 ## Features
 
 * **MCP Protocol Support**: Full implementation of MCP protocol including initialization, tool calls, prompts, and notifications
 * **Session Management**: Automatic session creation and management with session-based authentication
 * **Tool Call Framework**: Easy-to-use trait-based system for implementing custom tool calls
 * **Prompt Support**: Register and expose prompts that MCP clients can discover and use
+* **Resource Support**: Expose data sources (files, schemas, etc.) that clients can read for context
 * **HTTP Integration**: Seamless integration with `my-http-server` as middleware
 * **Type-Safe Tool Definitions**: Leverages `my-ai-agent` for type-safe JSON schema generation
 * **Dynamic Enumeration**: Support for dynamically generated enum values based on runtime data
@@ -107,41 +189,103 @@ mcp_middleware.register_tool_call(service).await;
 You can also register prompts that MCP clients can discover and use:
 
 ```rust
-use mcp_server_middleware::PromptDefinition;
+use mcp_server_middleware::{McpPromptService, PromptDefinition};
+use std::collections::HashMap;
+use async_trait::async_trait;
 
-// Create a prompt with arguments
-let prompt = PromptDefinition::new(
-    "example_prompt".to_string(),
-    "An example prompt that demonstrates prompt functionality".to_string()
-)
-.with_argument(
-    "variable_name".to_string(),
-    "Description of what this variable represents".to_string(),
-    true  // required
-)
-.with_argument(
-    "optional_param".to_string(),
-    "An optional parameter".to_string(),
-    false  // optional
-);
+// Implement the prompt service
+pub struct MyPromptService;
 
-mcp_middleware.register_prompt(prompt);
+impl PromptDefinition for MyPromptService {
+    const PROMPT_NAME: &'static str = "example_prompt";
+    const DESCRIPTION: &'static str = "An example prompt that demonstrates prompt functionality";
+    
+    fn get_argument_descriptions() -> Vec<mcp_server_middleware::PromptArgumentDescription> {
+        vec![
+            mcp_server_middleware::PromptArgumentDescription {
+                name: "variable_name".to_string(),
+                description: "Description of what this variable represents".to_string(),
+                required: true,
+            },
+            mcp_server_middleware::PromptArgumentDescription {
+                name: "optional_param".to_string(),
+                description: "An optional parameter".to_string(),
+                required: false,
+            },
+        ]
+    }
+}
+
+#[async_trait]
+impl McpPromptService for MyPromptService {
+    async fn execute_prompt(
+        &self,
+        arguments: &HashMap<String, String>,
+    ) -> Result<mcp_server_middleware::PromptExecutionResult, String> {
+        let var_value = arguments.get("variable_name")
+            .ok_or("variable_name is required")?;
+        
+        Ok(mcp_server_middleware::PromptExecutionResult {
+            description: "Example prompt result".to_string(),
+            message: format!("Processing with variable: {}", var_value),
+        })
+    }
+}
+
+// Register the prompt
+let prompt_service = Arc::new(MyPromptService);
+mcp_middleware.register_prompt(prompt_service).await;
 ```
 
-You can also build prompts incrementally:
+### 5. Register Resources (Optional)
+
+Resources allow clients to read data sources. Implement a resource service:
 
 ```rust
-let mut prompt = PromptDefinition::new(
-    "my_prompt".to_string(),
-    "My prompt description".to_string()
-);
-prompt.add_argument("param1".to_string(), "First parameter".to_string(), true);
-prompt.add_argument("param2".to_string(), "Second parameter".to_string(), false);
+use mcp_server_middleware::{McpResourceService, ResourceDefinition, ResourceReadResult, ResourceContent};
+use async_trait::async_trait;
 
-mcp_middleware.register_prompt(prompt);
+pub struct MyResourceService;
+
+impl ResourceDefinition for MyResourceService {
+    const RESOURCE_URI: &'static str = "file:///example.txt";
+    const RESOURCE_NAME: &'static str = "example.txt";
+    const DESCRIPTION: &'static str = "An example resource file";
+    const MIME_TYPE: &'static str = "text/plain";
+    
+    // Optional: Override for additional metadata
+    fn get_title(&self) -> Option<&str> {
+        Some("Example Resource")
+    }
+    
+    fn get_size(&self) -> Option<u64> {
+        Some(1024) // Size in bytes
+    }
+}
+
+#[async_trait]
+impl McpResourceService for MyResourceService {
+    async fn read_resource(&self, uri: &str) -> Result<ResourceReadResult, String> {
+        // Read your resource content here
+        let content = "Resource content here".to_string();
+        
+        Ok(ResourceReadResult {
+            contents: vec![ResourceContent {
+                uri: uri.to_string(),
+                mime_type: "text/plain".to_string(),
+                text: Some(content),
+                blob: None,
+            }],
+        })
+    }
+}
+
+// Register the resource
+let resource_service = Arc::new(MyResourceService);
+mcp_middleware.register_resource(resource_service).await;
 ```
 
-### 5. Integrate with HTTP Server
+### 6. Integrate with HTTP Server
 
 Add the middleware to your HTTP server:
 
@@ -357,15 +501,51 @@ let prompt = PromptDefinition::new(
 
 ## MCP Protocol Support
 
-The middleware handles the following MCP protocol methods:
+The middleware fully implements the MCP protocol specification (2025-11-25) and handles the following protocol methods:
+
+### Core Protocol Methods
 
 * **`initialize`**: Initializes a new MCP session and returns server capabilities
-* **`tools/list`**: Returns a list of available tools with their schemas
+  - Declares support for tools, prompts, and resources
+  - Returns protocol version and server information
+  - Creates a new session with unique session ID
+
+* **`tools/list`**: Returns a list of available tools with their JSON schemas
+  - Includes input and output schemas for each tool
+  - Generated automatically from your Rust types using `ApplyJsonSchema`
+
 * **`tools/call`**: Executes a tool call with the provided arguments
+  - Validates input against the tool's schema
+  - Executes your service implementation
+  - Returns structured results or errors
+
 * **`prompts/list`**: Returns a list of available prompts with their arguments
-* **`ping`**: Health check endpoint
-* **`resources/list`**: Returns available resources (currently returns empty)
-* **`notifications/initialized`**: Handles initialization notifications
+  - Shows prompt names, descriptions, and argument definitions
+  - Includes required/optional status for each argument
+
+* **`prompts/get`**: Retrieves a prompt with variable substitution
+  - Executes the prompt template with provided arguments
+  - Returns formatted prompt messages ready for AI consumption
+
+* **`resources/list`**: Returns available resources with metadata
+  - Supports pagination via cursor-based navigation
+  - Includes resource URI, name, description, MIME type, and optional metadata (title, size, icons)
+
+* **`resources/read`**: Reads resource contents
+  - Returns text or binary content based on resource type
+  - Supports multiple content blocks per resource
+
+* **`ping`**: Health check endpoint for connection testing
+
+* **`notifications/initialized`**: Handles client initialization acknowledgment
+
+### Protocol Features
+
+- **JSON-RPC 2.0**: All requests/responses follow JSON-RPC 2.0 format
+- **Server-Sent Events (SSE)**: Streaming responses for real-time updates
+- **Session Management**: Secure session-based authentication via `mcp-session-id` header
+- **Type Safety**: Automatic JSON schema generation from Rust types
+- **Error Handling**: Standardized error codes and messages per MCP specification
 
 ## Session Management
 
