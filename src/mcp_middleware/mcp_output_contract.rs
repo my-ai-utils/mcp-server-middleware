@@ -51,24 +51,14 @@ pub fn compile_tool_calls(tools: Vec<ToolCallSchemaData>, id: i64) -> String {
     build(json_builder, id)
 }
 
-pub fn compile_prompts_list(prompts: Vec<&super::PromptDefinition>, id: i64) -> String {
+pub fn compile_prompts_list(prompts: Vec<super::PromptSchemaData>, id: i64) -> String {
     let json_builder = JsonObjectWriter::new().write_json_object("result", |result| {
         result.write_json_array("prompts", |mut arr| {
             for prompt in prompts.iter() {
                 arr = arr.write_json_object(|obj| {
-                    obj.write_json_array("arguments", |mut args_arr| {
-                        for arg in prompt.arguments.iter() {
-                            args_arr = args_arr.write_json_object(|arg_obj| {
-                                arg_obj
-                                    .write("name", arg.name.as_str())
-                                    .write("description", arg.description.as_str())
-                                    .write("required", arg.required)
-                            });
-                        }
-                        args_arr
-                    })
-                    .write("name", prompt.name.as_str())
-                    .write("description", prompt.description.as_str())
+                    obj.write("name", prompt.prompt.get_prompt_name())
+                        .write("description", prompt.prompt.get_description())
+                        .write_ref("arguments", &prompt.input)
                 });
             }
 
@@ -77,6 +67,40 @@ pub fn compile_prompts_list(prompts: Vec<&super::PromptDefinition>, id: i64) -> 
     });
 
     build(json_builder, id)
+}
+
+pub fn compile_get_prompt_response(response: String, id: i64, is_error: bool) -> String {
+    let mut result = JsonObjectWriter::new()
+        .write("jsonrpc", "2.0")
+        .write("id", id)
+        .write_json_object("result", |result| {
+            result
+                .write_json_array("messages", |arr| {
+                    arr.write_json_object(|obj| {
+                        obj.write("role", "user")
+                            .write_json_object("content", |content| {
+                                content.write_json_array("parts", |parts| {
+                                    parts.write_json_object(|part| {
+                                        part.write("type", "text").write("text", response.as_str())
+                                    })
+                                })
+                            })
+                    })
+                })
+                .write_if(
+                    "structuredContent",
+                    RawJsonObject::AsStr(&response),
+                    !is_error,
+                )
+                .write("isError", is_error)
+        })
+        .build();
+
+    result.push('\n');
+    result.push('\n');
+
+    result.insert_str(0, "data: ");
+    result
 }
 
 pub fn compile_execute_tool_call_response(response: String, id: i64, is_error: bool) -> String {

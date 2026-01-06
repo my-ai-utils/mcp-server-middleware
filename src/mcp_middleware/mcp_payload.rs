@@ -8,6 +8,7 @@ pub enum McpInputData {
     ToolsList,
     PromptsList,
     ExecuteToolCall(ExecuteToolCallModel),
+    GetPrompt(GetPromptModel),
     Ping,
     Other { method: String, data: String },
 }
@@ -23,6 +24,21 @@ impl McpInputData {
             "resources/list" => Self::ResourcesList,
             "tools/list" => Self::ToolsList,
             "prompts/list" => Self::PromptsList,
+            "prompts/get" => {
+                let model: Result<GetPromptModel, serde_json::Error> =
+                    serde_json::from_str(&params);
+                match model {
+                    Ok(model) => {
+                        return Self::GetPrompt(model);
+                    }
+                    Err(err) => {
+                        panic!(
+                            "Can not deserialize get prompt data: {}. Err: {:?}",
+                            params, err
+                        );
+                    }
+                }
+            }
             "ping" => Self::Ping,
             "tools/call" => {
                 let model: Result<ExecuteToolCallModel, serde_json::Error> =
@@ -51,6 +67,12 @@ impl McpInputData {
 pub struct ExecuteToolCallModel {
     pub name: String,
     pub arguments: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetPromptModel {
+    pub name: String,
+    pub arguments: Option<serde_json::Value>,
 }
 
 #[derive(Debug)]

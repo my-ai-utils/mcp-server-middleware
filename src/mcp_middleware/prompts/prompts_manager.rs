@@ -1,8 +1,15 @@
-use super::PromptDefinition;
-use std::collections::BTreeMap;
+use my_ai_agent::my_json;
+
+use super::*;
+use std::{collections::BTreeMap, sync::Arc};
+
+pub struct PromptSchemaData {
+    pub prompt: Arc<dyn McpPromptAbstract + Send + Sync + 'static>,
+    pub input: my_json::json_writer::JsonObjectWriter,
+}
 
 pub struct McpPrompts {
-    prompts: BTreeMap<String, PromptDefinition>,
+    prompts: BTreeMap<String, Arc<dyn McpPromptAbstract + Send + Sync + 'static>>,
 }
 
 impl McpPrompts {
@@ -12,21 +19,39 @@ impl McpPrompts {
         }
     }
 
+    pub fn add(&mut self, executor: Arc<dyn McpPromptAbstract + Send + Sync + 'static>) {
+        let name = executor.get_prompt_name().to_string();
+        self.prompts.insert(name, executor);
+    }
+
+    pub async fn execute(&self, prompt_name: &str, input: &str) -> Result<String, String> {
+        if let Some(executor) = self.prompts.get(prompt_name) {
+            return executor.execute(input).await;
+        }
+
+        Err(format!("Prompt with name {} is not found", prompt_name))
+    }
+
+    pub async fn get_list(&self) -> Vec<PromptSchemaData> {
+        let mut result = Vec::with_capacity(self.prompts.len());
+
+        for prompt in self.prompts.values() {
+            let input = prompt.get_input_params().await;
+            result.push(PromptSchemaData {
+                prompt: prompt.clone(),
+                input,
+            });
+        }
+
+        result
+    }
+
+    pub fn get(&self, name: &str) -> Option<Arc<dyn McpPromptAbstract + Send + Sync + 'static>> {
+        self.prompts.get(name).map(|p| p.clone())
+    }
+
     pub fn has_prompts(&self) -> bool {
         !self.prompts.is_empty()
-    }
-
-    pub fn register(&mut self, prompt: PromptDefinition) {
-        let name = prompt.name.clone();
-        self.prompts.insert(name, prompt);
-    }
-
-    pub fn get_list(&self) -> Vec<&PromptDefinition> {
-        self.prompts.values().collect()
-    }
-
-    pub fn get(&self, name: &str) -> Option<&PromptDefinition> {
-        self.prompts.get(name)
     }
 }
 

@@ -5,8 +5,8 @@ use rust_extensions::date_time::DateTimeAsMicroseconds;
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::mcp_middleware::{
-    McpInputPayload, McpPrompts, McpService, McpSessions, McpToolCalls, PromptDefinition,
-    SESSION_HEADER, ToolCallExecutor,
+    McpInputPayload, McpPromptService, McpPrompts, McpService, McpSessions, McpToolCalls,
+    PromptDefinition, PromptExecutor, SESSION_HEADER, ToolCallExecutor,
 };
 
 use my_ai_agent::{ToolDefinition, json_schema::*, my_json};
@@ -58,8 +58,21 @@ impl McpMiddleware {
         self.tool_calls.add(Arc::new(executor));
     }
 
-    pub fn register_prompt(&mut self, prompt: PromptDefinition) {
-        self.prompts.register(prompt);
+    pub async fn register_prompt<
+        InputData: JsonTypeDescription + Sized + Send + Sync + 'static + Serialize + DeserializeOwned,
+        OutputData: JsonTypeDescription + Sized + Send + Sync + 'static + Serialize + DeserializeOwned,
+        TMcpPromptService: McpPromptService<InputData, OutputData> + Send + Sync + 'static + PromptDefinition,
+    >(
+        &mut self,
+        service: Arc<TMcpPromptService>,
+    ) {
+        let executor: PromptExecutor<InputData, OutputData> = PromptExecutor {
+            prompt_name: TMcpPromptService::PROMPT_NAME,
+            description: TMcpPromptService::DESCRIPTION,
+            holder: service,
+        };
+
+        self.prompts.add(Arc::new(executor));
     }
 
     async fn handle_authorized_request(
@@ -133,10 +146,36 @@ impl McpMiddleware {
             }
 
             super::McpInputData::PromptsList => {
-                let list = self.prompts.get_list();
+                let list = self.prompts.get_list().await;
                 let response = super::mcp_output_contract::compile_prompts_list(list, id);
 
                 return send_response_as_stream(response, session_id, now);
+            }
+
+            super::McpInputData::GetPrompt(params) => {
+                let arguments = match params.arguments {
+                    Some(args) => serde_json::to_string(&args).unwrap(),
+                    None => "{}".to_string(),
+                };
+
+                match self.prompts.execute(&params.name, &arguments).await {
+                    Ok(response) => {
+                        let response = super::mcp_output_contract::compile_get_prompt_response(
+                            response, id, false,
+                        );
+                        return send_response_as_stream(response, session_id, now);
+                    }
+                    Err(err) => {
+                        println!(
+                            "Error executing prompt {} with params {}. Err: {}",
+                            params.name, arguments, err
+                        );
+                        let response =
+                            super::mcp_output_contract::compile_get_prompt_response(err, id, true);
+
+                        return send_response_as_stream(response, session_id, now);
+                    }
+                }
             }
 
             super::McpInputData::NotificationsInitialize => {
