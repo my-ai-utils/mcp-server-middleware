@@ -55,9 +55,10 @@ MCP servers expose capabilities through three main mechanisms:
 This middleware (`mcp-server-middleware`) is a **Rust library** that provides a complete, production-ready implementation of the MCP protocol specification. It offers:
 
 **Trait-Based Architecture**:
-- `McpService<Input, Output>`: Trait for implementing tool execution logic
+- `McpToolCall<Input, Output>`: Trait for implementing tool execution logic
 - `ToolDefinition`: Trait for providing tool metadata (name, description)
 - `McpPromptService`: Trait for implementing prompt templates
+- `PromptDefinition`: Trait for providing prompt metadata
 - `ResourceDefinition` & `McpResourceService`: Traits for resource management
 
 **Type Safety**:
@@ -131,42 +132,54 @@ let mut mcp_middleware = McpMiddleware::new(
 
 ### 2. Implement a Tool Service
 
-Create a service that implements the `McpService` trait:
+Create a service that implements the `McpToolCall` trait:
 
 ```rust
-use mcp_server_middleware::{McpService, ToolDefinition};
+use mcp_server_middleware::{McpToolCall, ToolDefinition};
 use my_ai_agent::{macros::ApplyJsonSchema, json_schema::*};
 use serde::{Deserialize, Serialize};
 use async_trait::async_trait;
+use std::sync::Arc;
 
 // Define your input and output types with JSON schema
 #[derive(ApplyJsonSchema, Debug, Serialize, Deserialize)]
 pub struct MyToolRequest {
-    #[property(description: "Input parameter description")]
+    #[property(description = "Input parameter description")]
     pub input_field: String,
 }
 
 #[derive(ApplyJsonSchema, Debug, Serialize, Deserialize)]
 pub struct MyToolResponse {
-    #[property(description: "Output parameter description")]
+    #[property(description = "Output parameter description")]
     pub output_field: String,
 }
 
+// Create your handler struct
+pub struct MyToolHandler {
+    // Add any dependencies you need (e.g., app context, database connection, etc.)
+}
+
+impl MyToolHandler {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
 // Implement ToolDefinition to provide metadata
-impl ToolDefinition for MyMcpService {
+impl ToolDefinition for MyToolHandler {
     const FUNC_NAME: &'static str = "my_tool";
     const DESCRIPTION: &'static str = "Description of what this tool does";
 }
 
-// Implement McpService to handle tool execution
-#[async_trait]
-impl McpService<MyToolRequest, MyToolResponse> for MyMcpService {
+// Implement McpToolCall to handle tool execution
+#[async_trait::async_trait]
+impl McpToolCall<MyToolRequest, MyToolResponse> for MyToolHandler {
     async fn execute_tool_call(
         &self,
         request: MyToolRequest,
     ) -> Result<MyToolResponse, String> {
         // Your implementation here
-        let result = self.process_request(request.input_field).await?;
+        let result = format!("Processed: {}", request.input_field);
         
         Ok(MyToolResponse {
             output_field: result,
@@ -180,7 +193,7 @@ impl McpService<MyToolRequest, MyToolResponse> for MyMcpService {
 Register your service with the middleware:
 
 ```rust
-let service = Arc::new(MyMcpService::new(app_context));
+let service = Arc::new(MyToolHandler::new());
 mcp_middleware.register_tool_call(service).await;
 ```
 
@@ -341,32 +354,186 @@ async fn get_project_name_enum() -> Option<Vec<StrOrString<'static>>> {
 
 The enum functions are automatically discovered and called when generating the JSON schema for your tool. The returned values will be included in the tool's input schema as enum constraints, providing clients with the available options for each parameter. This is particularly useful for parameters that depend on your application's current state, such as filtering by available cities, selecting from active projects, or choosing from dynamically loaded configuration options.
 
+## Creating Tool Calls and Prompts
+
+### Step-by-Step Guide for Tool Calls
+
+1. **Create the tool call file** (e.g., `my_tool_call.rs`)
+
+2. **Define Input and Output Structures** with `ApplyJsonSchema`:
+
+```rust
+#[derive(ApplyJsonSchema, Debug, Serialize, Deserialize)]
+pub struct MyToolInputData {
+    #[property(description = "Description of the parameter")]
+    pub parameter_name: String,
+    
+    #[property(description = "Another parameter")]
+    pub another_param: Option<i32>,
+}
+
+#[derive(ApplyJsonSchema, Debug, Serialize, Deserialize)]
+pub struct MyToolResponse {
+    #[property(description = "Result description")]
+    pub result: String,
+    
+    #[property(description = "Status code")]
+    pub status: i32,
+}
+```
+
+3. **Create the Handler Struct**:
+
+```rust
+pub struct MyToolHandler {
+    // Add dependencies if needed (e.g., app context)
+}
+
+impl MyToolHandler {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+```
+
+4. **Implement `ToolDefinition` Trait**:
+
+```rust
+impl ToolDefinition for MyToolHandler {
+    const FUNC_NAME: &'static str = "my_tool_name";
+    const DESCRIPTION: &'static str = "Clear description of what this tool does";
+}
+```
+
+5. **Implement `McpToolCall` Trait**:
+
+```rust
+#[async_trait::async_trait]
+impl McpToolCall<MyToolInputData, MyToolResponse> for MyToolHandler {
+    async fn execute_tool_call(
+        &self,
+        model: MyToolInputData,
+    ) -> Result<MyToolResponse, String> {
+        // Your implementation here
+        let result = MyToolResponse {
+            result: "Success".to_string(),
+            status: 200,
+        };
+        
+        Ok(result)
+    }
+}
+```
+
+6. **Register in your startup code**:
+
+```rust
+mcp_middleware.register_tool_call(Arc::new(MyToolHandler::new())).await;
+```
+
+### Step-by-Step Guide for Prompts
+
+1. **Create the prompt handler struct**:
+
+```rust
+pub struct MyPromptHandler;
+```
+
+2. **Implement `PromptDefinition` Trait**:
+
+```rust
+impl PromptDefinition for MyPromptHandler {
+    const PROMPT_NAME: &'static str = "my_prompt_name";
+    const DESCRIPTION: &'static str = "Description of what this prompt provides";
+    
+    fn get_argument_descriptions() -> Vec<PromptArgumentDescription> {
+        vec![
+            PromptArgumentDescription {
+                name: "param1".to_string(),
+                description: "Description of param1".to_string(),
+                required: true,
+            },
+            PromptArgumentDescription {
+                name: "param2".to_string(),
+                description: "Description of param2".to_string(),
+                required: false,
+            },
+        ]
+    }
+}
+```
+
+3. **Implement `McpPromptService` Trait**:
+
+```rust
+#[async_trait::async_trait]
+impl McpPromptService for MyPromptHandler {
+    async fn execute_prompt(
+        &self,
+        arguments: &HashMap<String, String>,
+    ) -> Result<PromptExecutionResult, String> {
+        // Access arguments if needed
+        let param1 = arguments.get("param1");
+        
+        // Build your prompt content
+        let prompt_content = format!(
+            r#"
+# Your Prompt Title
+
+## Section 1
+Content here...
+"#
+        );
+        
+        let result = PromptExecutionResult {
+            description: "What this prompt provides".to_string(),
+            message: prompt_content,
+        };
+        
+        Ok(result)
+    }
+}
+```
+
+4. **Register in your startup code**:
+
+```rust
+mcp_middleware.register_prompt(Arc::new(MyPromptHandler)).await;
+```
+
 ## Complete Example: Postgres MCP Server
 
 The following example demonstrates a real-world implementation - a Postgres MCP server that allows AI agents to execute SQL queries. This serves as a concrete reference for building your own MCP servers:
 
 ```rust
 use std::sync::Arc;
-use mcp_server_middleware::{McpMiddleware, McpService, ToolDefinition};
+use mcp_server_middleware::{McpMiddleware, McpToolCall, ToolDefinition};
 use my_http_server::MyHttpServer;
 use my_ai_agent::{macros::ApplyJsonSchema, json_schema::*};
 use serde::{Deserialize, Serialize};
 use async_trait::async_trait;
+use std::net::SocketAddr;
 
 // Define your service
 pub struct PostgresMcpService {
     // Your service dependencies
 }
 
+impl PostgresMcpService {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
 #[derive(ApplyJsonSchema, Debug, Serialize, Deserialize)]
 pub struct SqlRequest {
-    #[property(description: "SQL query to execute")]
+    #[property(description = "SQL query to execute")]
     pub sql: String,
 }
 
 #[derive(ApplyJsonSchema, Debug, Serialize, Deserialize)]
 pub struct SqlResponse {
-    #[property(description: "Query result as JSON")]
+    #[property(description = "Query result as JSON")]
     pub result: String,
 }
 
@@ -375,8 +542,8 @@ impl ToolDefinition for PostgresMcpService {
     const DESCRIPTION: &'static str = "Execute SQL queries";
 }
 
-#[async_trait]
-impl McpService<SqlRequest, SqlResponse> for PostgresMcpService {
+#[async_trait::async_trait]
+impl McpToolCall<SqlRequest, SqlResponse> for PostgresMcpService {
     async fn execute_tool_call(
         &self,
         model: SqlRequest,
@@ -431,27 +598,28 @@ Creates a new middleware instance.
 
 Registers a tool call service. The service must implement:
 
-* `McpService<InputData, OutputData>` trait
+* `McpToolCall<InputData, OutputData>` trait
 * `ToolDefinition` trait
 * Input and output types must implement `JsonTypeDescription`, `Serialize`, and `DeserializeOwned`
 
 #### `register_prompt(prompt)`
 
-Registers a prompt definition. The prompt must be a `PromptDefinition` instance with:
-* `name`: Unique identifier for the prompt
-* `description`: Human-readable description of what the prompt does
-* `arguments`: Optional list of `PromptArgument` objects, each with:
-  * `name`: Argument identifier
-  * `description`: What the argument represents
-  * `required`: Whether the argument is required (boolean)
+Registers a prompt service. The service must implement:
 
-### `McpService` Trait
+* `McpPromptService` trait
+* `PromptDefinition` trait
+* The `PromptDefinition` trait requires:
+  * `PROMPT_NAME`: Unique identifier for the prompt (const)
+  * `DESCRIPTION`: Human-readable description (const)
+  * `get_argument_descriptions()`: Returns `Vec<PromptArgumentDescription>` with argument metadata
+
+### `McpToolCall` Trait
 
 Trait that must be implemented by your tool services:
 
 ```rust
-#[async_trait]
-pub trait McpService<InputData, OutputData>
+#[async_trait::async_trait]
+pub trait McpToolCall<InputData, OutputData>
 where
     InputData: JsonTypeDescription + Sized + Send + Sync + 'static,
     OutputData: JsonTypeDescription + Sized + Send + Sync + 'static,
@@ -471,32 +639,43 @@ pub trait ToolDefinition {
 }
 ```
 
-### `PromptDefinition` Struct
+### `PromptDefinition` Trait
 
-Represents a prompt that can be registered with the middleware:
+Trait that must be implemented by your prompt services:
 
 ```rust
-pub struct PromptDefinition {
-    pub name: String,
-    pub description: String,
-    pub arguments: Vec<PromptArgument>,
+pub trait PromptDefinition {
+    const PROMPT_NAME: &'static str;
+    const DESCRIPTION: &'static str;
+    
+    fn get_argument_descriptions() -> Vec<PromptArgumentDescription>;
 }
+```
 
-pub struct PromptArgument {
+### `PromptArgumentDescription` Struct
+
+Represents a prompt argument description:
+
+```rust
+pub struct PromptArgumentDescription {
     pub name: String,
     pub description: String,
     pub required: bool,
 }
 ```
 
-Create prompts using the builder pattern:
+### `McpPromptService` Trait
+
+Trait that must be implemented by your prompt services:
 
 ```rust
-let prompt = PromptDefinition::new(
-    "prompt_name".to_string(),
-    "Description".to_string()
-)
-.with_argument("arg1".to_string(), "Arg description".to_string(), true);
+#[async_trait::async_trait]
+pub trait McpPromptService {
+    async fn execute_prompt(
+        &self,
+        arguments: &HashMap<String, String>,
+    ) -> Result<PromptExecutionResult, String>;
+}
 ```
 
 ## MCP Protocol Support
@@ -534,6 +713,10 @@ The middleware fully implements the MCP protocol specification (2025-11-25) and 
 * **`resources/read`**: Reads resource contents
   - Returns text or binary content based on resource type
   - Supports multiple content blocks per resource
+
+* **`resources/subscribe`**: Subscribes to resource changes
+  - Returns the initial version of the resource
+  - Currently returns the first version only (update notifications not yet implemented)
 
 * **`ping`**: Health check endpoint for connection testing
 
@@ -573,6 +756,76 @@ The generated schemas are automatically used when clients call `tools/list` to d
 ## Error Handling
 
 Tool execution errors should be returned as `Err(String)` from `execute_tool_call`. The middleware will format these appropriately in the MCP response format, ensuring clients receive properly structured error information.
+
+## Best Practices
+
+### Naming Conventions
+
+* **Tool files**: `{snake_case_name}_tool_call.rs`
+* **Prompt files**: `{snake_case_name}_prompt.rs` or add to existing prompt files
+* **Handler structs**: `{PascalCaseName}Handler`
+* **Input/Output structs**: `{PascalCaseName}InputData` / `{PascalCaseName}Response`
+
+### Error Handling
+
+* Always return descriptive error messages
+* Use `Result<T, String>` - the String will be sent to the client
+* Handle errors gracefully and provide context
+
+### Documentation
+
+* Use `#[property(description = "...")]` for all fields in input/output structs
+* Write clear `DESCRIPTION` constants for tools and prompts
+* Document complex logic in comments
+
+### Project Structure
+
+When building an MCP server using this middleware, organize your code as follows:
+
+```
+src/
+├── lib.rs or main.rs
+├── mcp/                          # MCP tool calls and prompts
+│   ├── mod.rs                    # Export all MCP components
+│   ├── {tool_name}_tool_call.rs  # Individual tool implementations
+│   └── {prompt_name}_prompt.rs   # Individual prompt implementations
+└── http/
+    └── start_up.rs               # Register tools and prompts here
+```
+
+### Registration Order
+
+In your startup code, register components in this order:
+
+1. Create `McpMiddleware` instance
+2. Register all tool calls using `register_tool_call()`
+3. Register all prompts using `register_prompt()`
+4. Register all resources using `register_resource()`
+5. Add middleware to HTTP server
+
+```rust
+let mut mcp = McpMiddleware::new(
+    "/mcp",
+    "My MCP Server",
+    "0.1.0",
+    "Server description",
+);
+
+// Register tools
+mcp.register_tool_call(Arc::new(Tool1Handler::new())).await;
+mcp.register_tool_call(Arc::new(Tool2Handler::new())).await;
+
+// Register prompts
+mcp.register_prompt(Arc::new(Prompt1Handler)).await;
+mcp.register_prompt(Arc::new(Prompt2Handler)).await;
+
+// Register resources
+mcp.register_resource(Arc::new(Resource1Handler)).await;
+
+// Add to HTTP server
+let mcp = Arc::new(mcp);
+http_server.add_middleware(mcp);
+```
 
 ## Use Cases
 
