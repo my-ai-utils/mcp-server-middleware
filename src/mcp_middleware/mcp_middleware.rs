@@ -272,6 +272,7 @@ fn send_response(response: String) -> Result<HttpOkResult, HttpFailResult> {
 }
      */
 
+/*
 fn send_error_response_as_stream(
     error_mgs: String,
     session_id: &str,
@@ -293,6 +294,7 @@ fn send_error_response_as_stream(
     println!("Response: {:?}", response);
     send_response_as_stream(response, session_id, now)
 }
+     */
 
 fn send_response_as_stream(
     response: String,

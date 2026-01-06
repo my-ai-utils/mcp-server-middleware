@@ -85,6 +85,7 @@ pub fn compile_get_prompt_response(response: String, id: i64, is_error: bool) ->
         .write("id", id)
         .write_json_object("result", |result| {
             result
+                .write("description", "test description")
                 .write_json_array("messages", |arr| {
                     arr.write_json_object(|obj| {
                         obj.write("role", "user")
@@ -104,10 +105,14 @@ pub fn compile_get_prompt_response(response: String, id: i64, is_error: bool) ->
         })
         .build();
 
+    result.insert_str(0, "data: ");
     result.push('\n');
     result.push('\n');
 
-    result.insert_str(0, "data: ");
+    println!("-----");
+    println!("{}", result);
+    println!("-----");
+
     result
 }
 
