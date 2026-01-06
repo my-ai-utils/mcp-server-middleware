@@ -18,6 +18,7 @@ pub fn compile_init_response(
                 .write_json_object("capabilities", |cap| {
                     cap.write_json_object("resources", |res| res.write("listChanged", true))
                         .write_json_object("tools", |res| res.write("listChanged", true))
+                        .write_json_object("prompts", |res| res.write("listChanged", true))
                 })
                 .write_json_object("serverInfo", |server_info| {
                     server_info.write("name", name).write("version", version)
