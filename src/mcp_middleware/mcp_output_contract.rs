@@ -89,11 +89,9 @@ pub fn compile_get_prompt_response(response: String, id: i64, is_error: bool) ->
                     arr.write_json_object(|obj| {
                         obj.write("role", "user")
                             .write_json_object("content", |content| {
-                                content.write_json_array("parts", |parts| {
-                                    parts.write_json_object(|part| {
-                                        part.write("type", "text").write("text", response.as_str())
-                                    })
-                                })
+                                content
+                                    .write("type", "text")
+                                    .write("text", response.as_str())
                             })
                     })
                 })
