@@ -6,9 +6,10 @@ The middleware provides a flexible, trait-based architecture that allows you to 
 
 ## Features
 
-* **MCP Protocol Support**: Full implementation of MCP protocol including initialization, tool calls, and notifications
+* **MCP Protocol Support**: Full implementation of MCP protocol including initialization, tool calls, prompts, and notifications
 * **Session Management**: Automatic session creation and management with session-based authentication
 * **Tool Call Framework**: Easy-to-use trait-based system for implementing custom tool calls
+* **Prompt Support**: Register and expose prompts that MCP clients can discover and use
 * **HTTP Integration**: Seamless integration with `my-http-server` as middleware
 * **Type-Safe Tool Definitions**: Leverages `my-ai-agent` for type-safe JSON schema generation
 * **Dynamic Enumeration**: Support for dynamically generated enum values based on runtime data
@@ -101,7 +102,46 @@ let service = Arc::new(MyMcpService::new(app_context));
 mcp_middleware.register_tool_call(service).await;
 ```
 
-### 4. Integrate with HTTP Server
+### 4. Register Prompts (Optional)
+
+You can also register prompts that MCP clients can discover and use:
+
+```rust
+use mcp_server_middleware::PromptDefinition;
+
+// Create a prompt with arguments
+let prompt = PromptDefinition::new(
+    "example_prompt".to_string(),
+    "An example prompt that demonstrates prompt functionality".to_string()
+)
+.with_argument(
+    "variable_name".to_string(),
+    "Description of what this variable represents".to_string(),
+    true  // required
+)
+.with_argument(
+    "optional_param".to_string(),
+    "An optional parameter".to_string(),
+    false  // optional
+);
+
+mcp_middleware.register_prompt(prompt);
+```
+
+You can also build prompts incrementally:
+
+```rust
+let mut prompt = PromptDefinition::new(
+    "my_prompt".to_string(),
+    "My prompt description".to_string()
+);
+prompt.add_argument("param1".to_string(), "First parameter".to_string(), true);
+prompt.add_argument("param2".to_string(), "Second parameter".to_string(), false);
+
+mcp_middleware.register_prompt(prompt);
+```
+
+### 5. Integrate with HTTP Server
 
 Add the middleware to your HTTP server:
 
@@ -251,6 +291,16 @@ Registers a tool call service. The service must implement:
 * `ToolDefinition` trait
 * Input and output types must implement `JsonTypeDescription`, `Serialize`, and `DeserializeOwned`
 
+#### `register_prompt(prompt)`
+
+Registers a prompt definition. The prompt must be a `PromptDefinition` instance with:
+* `name`: Unique identifier for the prompt
+* `description`: Human-readable description of what the prompt does
+* `arguments`: Optional list of `PromptArgument` objects, each with:
+  * `name`: Argument identifier
+  * `description`: What the argument represents
+  * `required`: Whether the argument is required (boolean)
+
 ### `McpService` Trait
 
 Trait that must be implemented by your tool services:
@@ -277,6 +327,34 @@ pub trait ToolDefinition {
 }
 ```
 
+### `PromptDefinition` Struct
+
+Represents a prompt that can be registered with the middleware:
+
+```rust
+pub struct PromptDefinition {
+    pub name: String,
+    pub description: String,
+    pub arguments: Vec<PromptArgument>,
+}
+
+pub struct PromptArgument {
+    pub name: String,
+    pub description: String,
+    pub required: bool,
+}
+```
+
+Create prompts using the builder pattern:
+
+```rust
+let prompt = PromptDefinition::new(
+    "prompt_name".to_string(),
+    "Description".to_string()
+)
+.with_argument("arg1".to_string(), "Arg description".to_string(), true);
+```
+
 ## MCP Protocol Support
 
 The middleware handles the following MCP protocol methods:
@@ -284,6 +362,7 @@ The middleware handles the following MCP protocol methods:
 * **`initialize`**: Initializes a new MCP session and returns server capabilities
 * **`tools/list`**: Returns a list of available tools with their schemas
 * **`tools/call`**: Executes a tool call with the provided arguments
+* **`prompts/list`**: Returns a list of available prompts with their arguments
 * **`ping`**: Health check endpoint
 * **`resources/list`**: Returns available resources (currently returns empty)
 * **`notifications/initialized`**: Handles initialization notifications
@@ -309,7 +388,7 @@ pub struct MyRequest {
 }
 ```
 
-The generated schemas are automatically used when clients call `tools/list` to discover available tools.
+The generated schemas are automatically used when clients call `tools/list` to discover available tools. Similarly, registered prompts are exposed when clients call `prompts/list`.
 
 ## Error Handling
 
@@ -324,8 +403,9 @@ This middleware can be used to build MCP servers for various purposes:
 * **API Integrations**: Wrap external APIs and services as MCP tools
 * **Development Tools**: Expose build, test, and deployment operations
 * **Custom Business Logic**: Implement domain-specific tools for your application
+* **Prompt Templates**: Register reusable prompt templates that AI agents can use with variable substitution
 
-The Postgres example above demonstrates one such use case. You can adapt the same pattern to implement tools for any functionality you need.
+The Postgres example above demonstrates one such use case. You can adapt the same pattern to implement tools for any functionality you need. Prompts are useful for providing pre-configured prompt templates that clients can use with different variable values.
 
 ## Dependencies
 

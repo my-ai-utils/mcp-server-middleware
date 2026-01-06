@@ -10,6 +10,7 @@ pub fn compile_init_response(
     instructions: &str,
     protocol_version: &str,
     id: i64,
+    has_prompts: bool,
 ) -> String {
     let json_builder =
         my_json::json_writer::JsonObjectWriter::new().write_json_object("result", |result| {
@@ -18,7 +19,9 @@ pub fn compile_init_response(
                 .write_json_object("capabilities", |cap| {
                     cap.write_json_object("resources", |res| res.write("listChanged", true))
                         .write_json_object("tools", |res| res.write("listChanged", true))
-                        .write_json_object("prompts", |res| res.write("listChanged", true))
+                        .write_json_object_if("prompts", has_prompts, |res| {
+                            res.write("listChanged", true)
+                        })
                 })
                 .write_json_object("serverInfo", |server_info| {
                     server_info.write("name", name).write("version", version)
@@ -38,6 +41,34 @@ pub fn compile_tool_calls(tools: Vec<ToolCallSchemaData>, id: i64) -> String {
                         .write("description", tool.mcp.get_description())
                         .write_ref("inputSchema", &tool.input)
                         .write_ref("outputSchema", &tool.output)
+                });
+            }
+
+            arr
+        })
+    });
+
+    build(json_builder, id)
+}
+
+pub fn compile_prompts_list(prompts: Vec<&super::PromptDefinition>, id: i64) -> String {
+    let json_builder = JsonObjectWriter::new().write_json_object("result", |result| {
+        result.write_json_array("prompts", |mut arr| {
+            for prompt in prompts.iter() {
+                arr = arr.write_json_object(|obj| {
+                    obj.write_json_array("arguments", |mut args_arr| {
+                        for arg in prompt.arguments.iter() {
+                            args_arr = args_arr.write_json_object(|arg_obj| {
+                                arg_obj
+                                    .write("name", arg.name.as_str())
+                                    .write("description", arg.description.as_str())
+                                    .write("required", arg.required)
+                            });
+                        }
+                        args_arr
+                    })
+                    .write("name", prompt.name.as_str())
+                    .write("description", prompt.description.as_str())
                 });
             }
 

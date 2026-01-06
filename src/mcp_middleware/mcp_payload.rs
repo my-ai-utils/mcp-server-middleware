@@ -6,6 +6,7 @@ pub enum McpInputData {
     ResourcesList,
     NotificationsInitialize,
     ToolsList,
+    PromptsList,
     ExecuteToolCall(ExecuteToolCallModel),
     Ping,
     Other { method: String, data: String },
@@ -21,6 +22,7 @@ impl McpInputData {
             "notifications/initialized" => Self::NotificationsInitialize,
             "resources/list" => Self::ResourcesList,
             "tools/list" => Self::ToolsList,
+            "prompts/list" => Self::PromptsList,
             "ping" => Self::Ping,
             "tools/call" => {
                 let model: Result<ExecuteToolCallModel, serde_json::Error> =

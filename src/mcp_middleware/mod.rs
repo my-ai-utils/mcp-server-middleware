@@ -10,5 +10,7 @@ mod mcp_middleware;
 pub use mcp_middleware::*;
 mod tool_calls;
 pub use tool_calls::*;
+mod prompts;
+pub use prompts::*;
 
 pub const SESSION_HEADER: &'static str = "mcp-session-id";

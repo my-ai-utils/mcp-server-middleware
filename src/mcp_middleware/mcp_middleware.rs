@@ -5,7 +5,8 @@ use rust_extensions::date_time::DateTimeAsMicroseconds;
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::mcp_middleware::{
-    McpInputPayload, McpService, McpSessions, McpToolCalls, SESSION_HEADER, ToolCallExecutor,
+    McpInputPayload, McpPrompts, McpService, McpSessions, McpToolCalls, PromptDefinition,
+    SESSION_HEADER, ToolCallExecutor,
 };
 
 use my_ai_agent::{ToolDefinition, json_schema::*, my_json};
@@ -17,6 +18,7 @@ pub struct McpMiddleware {
     instructions: &'static str,
     sessions: McpSessions,
     tool_calls: McpToolCalls,
+    prompts: McpPrompts,
 }
 
 impl McpMiddleware {
@@ -33,6 +35,7 @@ impl McpMiddleware {
             instructions,
             sessions: McpSessions::new(),
             tool_calls: McpToolCalls::new(),
+            prompts: McpPrompts::new(),
         }
     }
 
@@ -55,6 +58,10 @@ impl McpMiddleware {
         self.tool_calls.add(Arc::new(executor));
     }
 
+    pub fn register_prompt(&mut self, prompt: PromptDefinition) {
+        self.prompts.register(prompt);
+    }
+
     async fn handle_authorized_request(
         &self,
         session_id: &str,
@@ -72,6 +79,7 @@ impl McpMiddleware {
                     &self.instructions,
                     &contract.protocol_version,
                     id,
+                    self.prompts.has_prompts(),
                 );
 
                 let session_id = self
@@ -120,6 +128,13 @@ impl McpMiddleware {
             super::McpInputData::ToolsList => {
                 let list = self.tool_calls.get_list().await;
                 let response = super::mcp_output_contract::compile_tool_calls(list, id);
+
+                return send_response_as_stream(response, session_id, now);
+            }
+
+            super::McpInputData::PromptsList => {
+                let list = self.prompts.get_list();
+                let response = super::mcp_output_contract::compile_prompts_list(list, id);
 
                 return send_response_as_stream(response, session_id, now);
             }
@@ -180,6 +195,7 @@ impl McpMiddleware {
                     &self.instructions,
                     &contract.protocol_version,
                     id,
+                    self.prompts.has_prompts(),
                 );
 
                 let session_id = self
