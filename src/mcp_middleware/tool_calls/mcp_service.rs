@@ -2,7 +2,7 @@ use my_ai_agent::{json_schema::*, my_json};
 use my_http_server::async_trait;
 
 #[async_trait::async_trait]
-pub trait McpService<InputData, OutputData>
+pub trait McpToolCall<InputData, OutputData>
 where
     InputData: JsonTypeDescription + Sized + Send + Sync + 'static,
     OutputData: JsonTypeDescription + Sized + Send + Sync + 'static,
@@ -11,7 +11,7 @@ where
 }
 
 #[async_trait::async_trait]
-pub trait McpServiceAbstract {
+pub trait McpToolCallAbstract {
     async fn execute(&self, input: &str) -> Result<String, String>;
 
     fn get_fn_name(&self) -> &str;

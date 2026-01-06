@@ -1,6 +1,9 @@
 use std::{collections::HashMap, sync::Arc};
 
-use crate::mcp_middleware::{McpPromptAbstract, McpPromptService};
+use crate::{
+    PromptExecutionResult,
+    mcp_middleware::{McpPromptAbstract, McpPromptService},
+};
 use my_http_server::async_trait;
 
 pub struct PromptExecutor {
@@ -24,7 +27,10 @@ impl McpPromptAbstract for PromptExecutor {
         self.argument_descriptions.clone()
     }
 
-    async fn execute(&self, input: &HashMap<String, String>) -> Result<String, String> {
+    async fn execute(
+        &self,
+        input: &HashMap<String, String>,
+    ) -> Result<PromptExecutionResult, String> {
         self.holder.execute_prompt(input).await
     }
 }

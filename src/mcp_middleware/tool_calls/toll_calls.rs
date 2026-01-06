@@ -4,13 +4,13 @@ use super::*;
 use std::{collections::BTreeMap, sync::Arc};
 
 pub struct ToolCallSchemaData {
-    pub mcp: Arc<dyn McpServiceAbstract + Send + Sync + 'static>,
+    pub mcp: Arc<dyn McpToolCallAbstract + Send + Sync + 'static>,
     pub input: my_json::json_writer::JsonObjectWriter,
     pub output: my_json::json_writer::JsonObjectWriter,
 }
 
 pub struct McpToolCalls {
-    tool_calls: BTreeMap<String, Arc<dyn McpServiceAbstract + Send + Sync + 'static>>,
+    tool_calls: BTreeMap<String, Arc<dyn McpToolCallAbstract + Send + Sync + 'static>>,
 }
 
 impl McpToolCalls {
@@ -20,7 +20,7 @@ impl McpToolCalls {
         }
     }
 
-    pub fn add(&mut self, executor: Arc<dyn McpServiceAbstract + Send + Sync + 'static>) {
+    pub fn add(&mut self, executor: Arc<dyn McpToolCallAbstract + Send + Sync + 'static>) {
         let name = executor.get_fn_name().to_string();
         self.tool_calls.insert(name, executor);
     }

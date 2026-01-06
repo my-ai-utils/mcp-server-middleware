@@ -3,7 +3,7 @@ use std::sync::Arc;
 use my_ai_agent::{json_schema::*, my_json};
 use serde::{Serialize, de::DeserializeOwned};
 
-use crate::mcp_middleware::{McpService, McpServiceAbstract};
+use crate::mcp_middleware::{McpToolCall, McpToolCallAbstract};
 use my_http_server::async_trait;
 
 pub struct ToolCallExecutor<InputData, OutputData>
@@ -15,11 +15,11 @@ where
     pub description: &'static str,
     //pub input_params: my_json::json_writer::JsonObjectWriter,
     //pub output_params: my_json::json_writer::JsonObjectWriter,
-    pub holder: Arc<dyn McpService<InputData, OutputData> + Send + Sync + 'static>,
+    pub holder: Arc<dyn McpToolCall<InputData, OutputData> + Send + Sync + 'static>,
 }
 
 #[async_trait::async_trait]
-impl<InputData, OutputData> McpServiceAbstract for ToolCallExecutor<InputData, OutputData>
+impl<InputData, OutputData> McpToolCallAbstract for ToolCallExecutor<InputData, OutputData>
 where
     InputData: JsonTypeDescription + Sized + Send + Sync + 'static + Serialize + DeserializeOwned,
     OutputData: JsonTypeDescription + Sized + Send + Sync + 'static + Serialize + DeserializeOwned,

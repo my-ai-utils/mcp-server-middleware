@@ -79,20 +79,20 @@ pub fn compile_prompts_list(prompts: Vec<super::PromptSchemaData>, id: i64) -> S
     build(json_builder, id)
 }
 
-pub fn compile_get_prompt_response(response: String, id: i64) -> String {
+pub fn compile_get_prompt_response(response: PromptExecutionResult, id: i64) -> String {
     let mut result = JsonObjectWriter::new()
         .write("jsonrpc", "2.0")
         .write("id", id)
         .write_json_object("result", |result| {
             result
-                .write("description", "test description")
+                .write("description", response.description.as_str())
                 .write_json_array("messages", |arr| {
                     arr.write_json_object(|obj| {
                         obj.write("role", "user")
                             .write_json_object("content", |content| {
                                 content
                                     .write("type", "text")
-                                    .write("text", response.as_str())
+                                    .write("text", response.message.as_str())
                             })
                     })
                 })

@@ -5,7 +5,7 @@ use rust_extensions::date_time::DateTimeAsMicroseconds;
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::mcp_middleware::{
-    McpInputPayload, McpPromptService, McpPrompts, McpService, McpSessions, McpToolCalls,
+    McpInputPayload, McpPromptService, McpPrompts, McpSessions, McpToolCall, McpToolCalls,
     PromptDefinition, PromptExecutor, SESSION_HEADER, ToolCallExecutor,
 };
 
@@ -42,7 +42,7 @@ impl McpMiddleware {
     pub async fn register_tool_call<
         InputData: JsonTypeDescription + Sized + Send + Sync + 'static + Serialize + DeserializeOwned,
         OutputData: JsonTypeDescription + Sized + Send + Sync + 'static + Serialize + DeserializeOwned,
-        TMcpService: McpService<InputData, OutputData> + Send + Sync + 'static + ToolDefinition,
+        TMcpService: McpToolCall<InputData, OutputData> + Send + Sync + 'static + ToolDefinition,
     >(
         &mut self,
         service: Arc<TMcpService>,

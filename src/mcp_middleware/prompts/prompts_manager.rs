@@ -29,7 +29,7 @@ impl McpPrompts {
         &self,
         prompt_name: &str,
         input: &HashMap<String, String>,
-    ) -> Result<String, String> {
+    ) -> Result<PromptExecutionResult, String> {
         if let Some(executor) = self.prompts.get(prompt_name) {
             return executor.execute(input).await;
         }
