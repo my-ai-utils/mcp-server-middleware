@@ -7,6 +7,7 @@ pub enum McpInputData {
     Initialize(InitializeMpcContract),
     ResourcesList(ResourcesListModel),
     ReadResource(ReadResourceModel),
+    SubscribeResource(SubscribeResourceModel),
     NotificationsInitialize,
     ToolsList,
     PromptsList,
@@ -47,6 +48,21 @@ impl McpInputData {
                     Err(err) => {
                         panic!(
                             "Can not deserialize read resource data: {}. Err: {:?}",
+                            params, err
+                        );
+                    }
+                }
+            }
+            "resources/subscribe" => {
+                let model: Result<SubscribeResourceModel, serde_json::Error> =
+                    serde_json::from_str(&params);
+                match model {
+                    Ok(model) => {
+                        return Self::SubscribeResource(model);
+                    }
+                    Err(err) => {
+                        panic!(
+                            "Can not deserialize subscribe resource data: {}. Err: {:?}",
                             params, err
                         );
                     }
@@ -112,6 +128,11 @@ pub struct ResourcesListModel {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReadResourceModel {
+    pub uri: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SubscribeResourceModel {
     pub uri: String,
 }
 

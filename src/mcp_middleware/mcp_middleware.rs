@@ -163,6 +163,29 @@ impl McpMiddleware {
                 }
             }
 
+            super::McpInputData::SubscribeResource(params) => {
+                println!("Subscribing to resource with URI: {:?}", params.uri);
+
+                match self.resources.read(&params.uri).await {
+                    Ok(response) => {
+                        // Return the initial version of the resource
+                        // Note: We're not implementing updates, just returning the first version
+                        let response = super::mcp_output_contract::compile_read_resource_response(
+                            response, id,
+                        );
+                        return send_response_as_stream(response, session_id, now);
+                    }
+                    Err(err) => {
+                        println!(
+                            "Error subscribing to resource {} with URI {}. Err: {}",
+                            params.uri, params.uri, err
+                        );
+
+                        return send_error_response_as_stream(err, session_id, id, now);
+                    }
+                }
+            }
+
             super::McpInputData::Ping => {
                 let response = super::mcp_output_contract::build_ping_response(id);
                 return send_response_as_stream(response, session_id, now);
