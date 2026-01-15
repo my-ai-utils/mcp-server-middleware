@@ -24,7 +24,7 @@ impl McpResources {
 
     pub async fn read(&self, uri: &str) -> Result<ResourceReadResult, String> {
         if let Some(executor) = self.resources.get(uri) {
-            return executor.read(uri).await;
+            return executor.read().await;
         }
 
         Err(format!("Resource with URI {} is not found", uri))

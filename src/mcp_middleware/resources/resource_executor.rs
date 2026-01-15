@@ -46,7 +46,7 @@ impl McpResourceAbstract for ResourceExecutor {
         self.icons.clone()
     }
 
-    async fn read(&self, uri: &str) -> Result<ResourceReadResult, String> {
-        self.holder.read_resource(uri).await
+    async fn read(&self) -> Result<ResourceReadResult, String> {
+        self.holder.read_resource().await
     }
 }

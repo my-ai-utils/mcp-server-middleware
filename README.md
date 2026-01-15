@@ -278,13 +278,13 @@ impl ResourceDefinition for MyResourceService {
 
 #[async_trait]
 impl McpResourceService for MyResourceService {
-    async fn read_resource(&self, uri: &str) -> Result<ResourceReadResult, String> {
+    async fn read_resource(&self) -> Result<ResourceReadResult, String> {
         // Read your resource content here
         let content = "Resource content here".to_string();
         
         Ok(ResourceReadResult {
             contents: vec![ResourceContent {
-                uri: uri.to_string(),
+                uri: Self::RESOURCE_URI.to_string(),
                 mime_type: "text/plain".to_string(),
                 text: Some(content),
                 blob: None,

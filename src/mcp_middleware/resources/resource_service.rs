@@ -18,13 +18,13 @@ pub struct ResourceContent {
 /// Trait that must be implemented by resource services to handle resource reading
 #[async_trait::async_trait]
 pub trait McpResourceService {
-    async fn read_resource(&self, uri: &str) -> Result<ResourceReadResult, String>;
+    async fn read_resource(&self) -> Result<ResourceReadResult, String>;
 }
 
 /// Abstract trait for resource services (similar to McpPromptAbstract for prompts)
 #[async_trait::async_trait]
 pub trait McpResourceAbstract {
-    async fn read(&self, uri: &str) -> Result<ResourceReadResult, String>;
+    async fn read(&self) -> Result<ResourceReadResult, String>;
 
     fn get_resource_uri(&self) -> &str;
     fn get_resource_name(&self) -> &str;
