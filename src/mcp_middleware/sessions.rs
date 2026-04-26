@@ -81,4 +81,25 @@ impl McpSessions {
         let mut write_access = self.data.lock().await;
         write_access.remove(session_id).is_some()
     }
+
+    pub async fn clear_sender(&self, session_id: &str) {
+        let mut write_access = self.data.lock().await;
+        if let Some(session) = write_access.get_mut(session_id) {
+            session.sender = None;
+        }
+    }
+
+    pub async fn broadcast(&self, event: McpSocketUpdateEvent) {
+        let senders: Vec<_> = {
+            let read_access = self.data.lock().await;
+            read_access
+                .values()
+                .filter_map(|s| s.sender.clone())
+                .collect()
+        };
+
+        for sender in senders {
+            let _ = sender.send(event.clone()).await;
+        }
+    }
 }

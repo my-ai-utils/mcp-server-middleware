@@ -17,7 +17,7 @@ pub struct McpMiddleware {
     name: &'static str,
     version: &'static str,
     instructions: &'static str,
-    sessions: McpSessions,
+    sessions: Arc<McpSessions>,
     tool_calls: McpToolCalls,
     prompts: McpPrompts,
     resources: McpResources,
@@ -35,11 +35,29 @@ impl McpMiddleware {
             name,
             version,
             instructions,
-            sessions: McpSessions::new(),
+            sessions: Arc::new(McpSessions::new()),
             tool_calls: McpToolCalls::new(),
             prompts: McpPrompts::new(),
             resources: McpResources::new(),
         }
+    }
+
+    pub async fn notify_tools_changed(&self) {
+        self.sessions
+            .broadcast(super::McpSocketUpdateEvent::ToolsListChanged)
+            .await;
+    }
+
+    pub async fn notify_resources_changed(&self) {
+        self.sessions
+            .broadcast(super::McpSocketUpdateEvent::ResourcesListChanged)
+            .await;
+    }
+
+    pub async fn notify_prompts_changed(&self) {
+        self.sessions
+            .broadcast(super::McpSocketUpdateEvent::PromptsListChanged)
+            .await;
     }
 
     pub async fn register_tool_call<
@@ -429,7 +447,12 @@ impl HttpServerMiddleware for McpMiddleware {
                     .await
                 {
                     let (stream, producer) = HttpOutput::as_stream(32);
-                    tokio::spawn(super::stream_updates(producer, receiver));
+                    tokio::spawn(super::stream_updates(
+                        producer,
+                        receiver,
+                        self.sessions.clone(),
+                        session_id.clone(),
+                    ));
 
                     let now = DateTimeAsMicroseconds::now();
                     return Some(stream.with_header("date", now.to_rfc7231()).get_result());
