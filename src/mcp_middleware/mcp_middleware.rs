@@ -53,8 +53,6 @@ impl McpMiddleware {
         let executor: ToolCallExecutor<InputData, OutputData> = ToolCallExecutor {
             fn_name: TMcpService::FUNC_NAME,
             description: TMcpService::DESCRIPTION,
-            //  input_params: InputData::get_description(false).await,
-            //  output_params: OutputData::get_description(false).await,
             holder: service,
         };
 
@@ -132,12 +130,14 @@ impl McpMiddleware {
                 return send_response_as_stream(response, session_id.as_str(), now);
             }
 
-            super::McpInputData::ResourcesList(_params) => {
-                let list = self.resources.get_list().await;
-                // TODO: Implement pagination logic based on cursor
-                let next_cursor = None; // For now, no pagination
-                let response =
-                    super::mcp_output_contract::compile_resources_list(list, id, next_cursor);
+            super::McpInputData::ResourcesList(params) => {
+                let (list, next_cursor) =
+                    self.resources.get_list(params.cursor.as_deref()).await;
+                let response = super::mcp_output_contract::compile_resources_list(
+                    list,
+                    id,
+                    next_cursor.as_deref(),
+                );
 
                 return send_response_as_stream(response, session_id, now);
             }
@@ -192,7 +192,8 @@ impl McpMiddleware {
             }
 
             super::McpInputData::ExecuteToolCall(params) => {
-                let arguments = serde_json::to_string(&params.arguments).unwrap();
+                let arguments = serde_json::to_string(&params.arguments)
+                    .unwrap_or_else(|_| "{}".to_string());
 
                 match self.tool_calls.execute(&params.name, &arguments).await {
                     Ok(response) => {
@@ -279,7 +280,7 @@ impl McpMiddleware {
         session_id: Option<&str>,
         body: &[u8],
     ) -> Result<HttpOkResult, HttpFailResult> {
-        println!("Parsing: {}", std::str::from_utf8(body).unwrap());
+        println!("Parsing: {}", String::from_utf8_lossy(body));
 
         let payload = match super::McpInputPayload::try_parse(body) {
             Ok(payload) => payload,
@@ -297,6 +298,14 @@ impl McpMiddleware {
         let now = DateTimeAsMicroseconds::now();
 
         if let Some(session_id) = session_id {
+            if !self
+                .sessions
+                .check_session_and_update_last_used(session_id, now)
+                .await
+            {
+                return HttpOutput::as_unauthorized(None).into_err(false, false);
+            }
+
             return self
                 .handle_authorized_request(session_id, payload, now, id)
                 .await;
@@ -337,19 +346,6 @@ impl McpMiddleware {
         }
     }
 }
-
-/*
-fn send_response(response: String) -> Result<HttpOkResult, HttpFailResult> {
-    HttpOutput::Content {
-        status_code: 200,
-        headers: None,
-        content_type: Some(WebContentType::Json),
-        set_cookies: None,
-        content: response.into_bytes(),
-    }
-    .into_ok_result(false)
-}
-     */
 
 fn send_error_response_as_stream(
     error_mgs: String,
@@ -456,7 +452,29 @@ impl HttpServerMiddleware for McpMiddleware {
                     .await;
                 return Some(result);
             }
-            Method::DELETE => {}
+            Method::DELETE => {
+                let Some(session_id) = session_id else {
+                    return Some(
+                        HttpFailResult::as_unauthorized(Some("Unauthorized request")).into_err(),
+                    );
+                };
+
+                let removed = self.sessions.delete_session(session_id.as_str()).await;
+
+                if !removed {
+                    return Some(
+                        HttpFailResult::as_unauthorized(Some("Unknown session")).into_err(),
+                    );
+                }
+
+                let now = DateTimeAsMicroseconds::now();
+                return Some(
+                    HttpOutput::from_builder()
+                        .add_header("date", now.to_rfc7231())
+                        .set_status_code(204)
+                        .into_ok_result(false),
+                );
+            }
             _ => {}
         }
 

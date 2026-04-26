@@ -13,8 +13,6 @@ where
 {
     pub fn_name: &'static str,
     pub description: &'static str,
-    //pub input_params: my_json::json_writer::JsonObjectWriter,
-    //pub output_params: my_json::json_writer::JsonObjectWriter,
     pub holder: Arc<dyn McpToolCall<InputData, OutputData> + Send + Sync + 'static>,
 }
 

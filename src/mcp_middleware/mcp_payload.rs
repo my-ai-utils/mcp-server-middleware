@@ -18,93 +18,71 @@ pub enum McpInputData {
 }
 
 impl McpInputData {
-    pub fn from_str(method: &str, params: String) -> Self {
+    pub fn from_str(method: &str, params: String) -> Result<Self, String> {
         match method {
             "initialize" => {
-                let params = serde_json::from_str(&params).unwrap();
-                Self::Initialize(params)
+                let params = serde_json::from_str(&params).map_err(|err| {
+                    format!("Can not deserialize initialize data: {}. Err: {:?}", params, err)
+                })?;
+                Ok(Self::Initialize(params))
             }
-            "notifications/initialized" => Self::NotificationsInitialize,
+            "notifications/initialized" => Ok(Self::NotificationsInitialize),
             "resources/list" => {
                 let model: Result<ResourcesListModel, serde_json::Error> =
                     serde_json::from_str(&params);
                 match model {
-                    Ok(model) => {
-                        return Self::ResourcesList(model);
-                    }
+                    Ok(model) => Ok(Self::ResourcesList(model)),
                     Err(_) => {
                         // If params is empty or invalid, use default (no cursor)
-                        return Self::ResourcesList(ResourcesListModel { cursor: None });
+                        Ok(Self::ResourcesList(ResourcesListModel { cursor: None }))
                     }
                 }
             }
             "resources/read" => {
-                let model: Result<ReadResourceModel, serde_json::Error> =
-                    serde_json::from_str(&params);
-                match model {
-                    Ok(model) => {
-                        return Self::ReadResource(model);
-                    }
-                    Err(err) => {
-                        panic!(
-                            "Can not deserialize read resource data: {}. Err: {:?}",
-                            params, err
-                        );
-                    }
-                }
+                let model: ReadResourceModel = serde_json::from_str(&params).map_err(|err| {
+                    format!(
+                        "Can not deserialize read resource data: {}. Err: {:?}",
+                        params, err
+                    )
+                })?;
+                Ok(Self::ReadResource(model))
             }
             "resources/subscribe" => {
-                let model: Result<SubscribeResourceModel, serde_json::Error> =
-                    serde_json::from_str(&params);
-                match model {
-                    Ok(model) => {
-                        return Self::SubscribeResource(model);
-                    }
-                    Err(err) => {
-                        panic!(
+                let model: SubscribeResourceModel =
+                    serde_json::from_str(&params).map_err(|err| {
+                        format!(
                             "Can not deserialize subscribe resource data: {}. Err: {:?}",
                             params, err
-                        );
-                    }
-                }
+                        )
+                    })?;
+                Ok(Self::SubscribeResource(model))
             }
-            "tools/list" => Self::ToolsList,
-            "prompts/list" => Self::PromptsList,
+            "tools/list" => Ok(Self::ToolsList),
+            "prompts/list" => Ok(Self::PromptsList),
             "prompts/get" => {
-                let model: Result<GetPromptModel, serde_json::Error> =
-                    serde_json::from_str(&params);
-                match model {
-                    Ok(model) => {
-                        return Self::GetPrompt(model);
-                    }
-                    Err(err) => {
-                        panic!(
-                            "Can not deserialize get prompt data: {}. Err: {:?}",
-                            params, err
-                        );
-                    }
-                }
+                let model: GetPromptModel = serde_json::from_str(&params).map_err(|err| {
+                    format!(
+                        "Can not deserialize get prompt data: {}. Err: {:?}",
+                        params, err
+                    )
+                })?;
+                Ok(Self::GetPrompt(model))
             }
-            "ping" => Self::Ping,
+            "ping" => Ok(Self::Ping),
             "tools/call" => {
-                let model: Result<ExecuteToolCallModel, serde_json::Error> =
-                    serde_json::from_str(&params);
-                match model {
-                    Ok(model) => {
-                        return Self::ExecuteToolCall(model);
-                    }
-                    Err(err) => {
-                        panic!(
-                            "Can not deserialize execute too call data: {}. Err: {:?}",
+                let model: ExecuteToolCallModel =
+                    serde_json::from_str(&params).map_err(|err| {
+                        format!(
+                            "Can not deserialize tool call data: {}. Err: {:?}",
                             params, err
-                        );
-                    }
-                }
+                        )
+                    })?;
+                Ok(Self::ExecuteToolCall(model))
             }
-            _ => Self::Other {
+            _ => Ok(Self::Other {
                 method: method.to_string(),
                 data: params.to_string(),
-            },
+            }),
         }
     }
 }
@@ -191,8 +169,8 @@ impl McpInputPayload {
         };
 
         let data = match params {
-            Some(params) => McpInputData::from_str(method.as_str(), params),
-            None => McpInputData::from_str(method.as_str(), String::new()),
+            Some(params) => McpInputData::from_str(method.as_str(), params)?,
+            None => McpInputData::from_str(method.as_str(), String::new())?,
         };
 
         Ok(Self {

@@ -1,5 +1,8 @@
 use super::*;
+use std::ops::Bound;
 use std::sync::Arc;
+
+const PAGE_SIZE: usize = 100;
 
 pub struct ResourceSchemaData {
     pub resource: Arc<dyn McpResourceAbstract + Send + Sync + 'static>,
@@ -30,16 +33,35 @@ impl McpResources {
         Err(format!("Resource with URI {} is not found", uri))
     }
 
-    pub async fn get_list(&self) -> Vec<ResourceSchemaData> {
-        let mut result = Vec::with_capacity(self.resources.len());
+    pub async fn get_list(
+        &self,
+        cursor: Option<&str>,
+    ) -> (Vec<ResourceSchemaData>, Option<String>) {
+        let lower = match cursor {
+            Some(c) => Bound::Excluded(c.to_string()),
+            None => Bound::Unbounded,
+        };
 
-        for resource in self.resources.values() {
-            result.push(ResourceSchemaData {
-                resource: resource.clone(),
-            });
+        let mut iter = self.resources.range((lower, Bound::Unbounded));
+
+        let mut result = Vec::with_capacity(PAGE_SIZE);
+        let mut last_uri: Option<String> = None;
+
+        for _ in 0..PAGE_SIZE {
+            match iter.next() {
+                Some((uri, resource)) => {
+                    last_uri = Some(uri.clone());
+                    result.push(ResourceSchemaData {
+                        resource: resource.clone(),
+                    });
+                }
+                None => break,
+            }
         }
 
-        result
+        let next_cursor = if iter.next().is_some() { last_uri } else { None };
+
+        (result, next_cursor)
     }
 }
 

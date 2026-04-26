@@ -76,4 +76,9 @@ impl McpSessions {
 
         false
     }
+
+    pub async fn delete_session(&self, session_id: &str) -> bool {
+        let mut write_access = self.data.lock().await;
+        write_access.remove(session_id).is_some()
+    }
 }
