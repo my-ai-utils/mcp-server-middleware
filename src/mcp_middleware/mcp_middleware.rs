@@ -127,7 +127,7 @@ impl McpMiddleware {
     ) -> Result<HttpOkResult, HttpFailResult> {
         match payload.data {
             super::McpInputData::Initialize(contract) => {
-                println!("Initializing {:?}", contract);
+                //println!("Initializing {:?}", contract);
 
                 let response = super::mcp_output_contract::compile_init_response(
                     &self.name,
@@ -161,7 +161,7 @@ impl McpMiddleware {
             }
 
             super::McpInputData::ReadResource(params) => {
-                println!("Reading resource with URI: {:?}", params.uri);
+                //println!("Reading resource with URI: {:?}", params.uri);
 
                 match self.resources.read(&params.uri).await {
                     Ok(response) => {
@@ -171,7 +171,7 @@ impl McpMiddleware {
                         return send_response_as_stream(response, session_id, now);
                     }
                     Err(err) => {
-                        println!(
+                        eprintln!(
                             "Error reading resource {} with URI {}. Err: {}",
                             params.uri, params.uri, err
                         );
@@ -182,7 +182,7 @@ impl McpMiddleware {
             }
 
             super::McpInputData::SubscribeResource(params) => {
-                println!("Subscribing to resource with URI: {:?}", params.uri);
+              //  println!("Subscribing to resource with URI: {:?}", params.uri);
 
                 match self.resources.read(&params.uri).await {
                     Ok(response) => {
@@ -194,7 +194,7 @@ impl McpMiddleware {
                         return send_response_as_stream(response, session_id, now);
                     }
                     Err(err) => {
-                        println!(
+                        eprintln!(
                             "Error subscribing to resource {} with URI {}. Err: {}",
                             params.uri, params.uri, err
                         );
@@ -222,7 +222,7 @@ impl McpMiddleware {
                         return send_response_as_stream(response, session_id, now);
                     }
                     Err(err) => {
-                        println!(
+                        eprintln!(
                             "Error executing {} with params {}. Err: {}",
                             params.name, arguments, err
                         );
@@ -251,7 +251,7 @@ impl McpMiddleware {
             }
 
             super::McpInputData::GetPrompt(params) => {
-                println!("Getting prompts with params: {:?}", params);
+                //println!("Getting prompts with params: {:?}", params);
 
                 let arguments = match params.arguments {
                     Some(args) => args,
@@ -265,7 +265,7 @@ impl McpMiddleware {
                         return send_response_as_stream(response, session_id, now);
                     }
                     Err(err) => {
-                        println!(
+                        eprintln!(
                             "Error executing prompt {} with params {:?}. Err: {}",
                             params.name, arguments, err
                         );
@@ -276,7 +276,7 @@ impl McpMiddleware {
             }
 
             super::McpInputData::NotificationsInitialize => {
-                println!("Sending notifications Initialize");
+                //println!("Sending notifications Initialize");
                 return HttpOutput::from_builder()
                     .add_header("date", now.to_rfc7231())
                     .set_status_code(202)
@@ -298,7 +298,7 @@ impl McpMiddleware {
         session_id: Option<&str>,
         body: &[u8],
     ) -> Result<HttpOkResult, HttpFailResult> {
-        println!("Parsing: {}", String::from_utf8_lossy(body));
+        //println!("Parsing: {}", String::from_utf8_lossy(body));
 
         let payload = match super::McpInputPayload::try_parse(body) {
             Ok(payload) => payload,
@@ -331,7 +331,7 @@ impl McpMiddleware {
 
         match payload.data {
             super::McpInputData::Initialize(contract) => {
-                println!("Initializing {:?}", contract);
+                //println!("Initializing {:?}", contract);
 
                 let response = super::mcp_output_contract::compile_init_response(
                     &self.name,
@@ -352,7 +352,7 @@ impl McpMiddleware {
                 send_response_as_stream(response, session_id.as_str(), now)
             }
             super::McpInputData::Other { method, data } => {
-                println!("Unsupported method: {}. Data: `{}`", method, data);
+                eprintln!("Unsupported method: {}. Data: `{}`", method, data);
                 return HttpOutput::as_fatal_error(format!(
                     "Unsupported method: {}. data: {}",
                     method, data
@@ -394,7 +394,7 @@ fn send_response_as_stream(
 ) -> Result<HttpOkResult, HttpFailResult> {
     let (http_output, mut producer) = HttpOutput::as_stream(1024);
     tokio::spawn(async move {
-        println!("Sending response: `{}`", response);
+      //  println!("Sending response: `{}`", response);
         let payload = response.into_bytes();
         producer.send(payload).await.unwrap();
     });
@@ -421,12 +421,13 @@ impl HttpServerMiddleware for McpMiddleware {
             return None;
         }
 
+        /*
         println!(
             "Mpc Middleware {:?} {}",
             ctx.request.method,
             ctx.request.get_path().as_str()
         );
-
+        */
         let session_id = ctx
             .request
             .get_headers()
