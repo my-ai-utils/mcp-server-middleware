@@ -25,7 +25,7 @@ impl McpToolCalls {
         self.tool_calls.insert(name, executor);
     }
 
-    pub async fn execute(&self, fn_name: &str, input: &str) -> Result<String, String> {
+    pub async fn execute(&self, fn_name: &str, input: &str) -> Result<ExecutedToolCall, String> {
         if let Some(executor) = self.tool_calls.get(fn_name) {
             return executor.execute(input).await;
         }

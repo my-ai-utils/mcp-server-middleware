@@ -207,7 +207,17 @@ pub fn compile_read_resource_response(response: ResourceReadResult, id: i64) -> 
     result
 }
 
-pub fn compile_execute_tool_call_response(response: String, id: i64, is_error: bool) -> String {
+pub fn compile_execute_tool_call_response(
+    response: String,
+    instruction: Option<String>,
+    id: i64,
+    is_error: bool,
+) -> String {
+    let content_text = match instruction.as_deref() {
+        Some(text) => text.to_string(),
+        None => response.clone(),
+    };
+
     let mut result = JsonObjectWriter::new()
         .write("jsonrpc", "2.0")
         .write("id", id)
@@ -215,7 +225,7 @@ pub fn compile_execute_tool_call_response(response: String, id: i64, is_error: b
             result
                 .write_json_array("content", |arr| {
                     arr.write_json_object(|obj| {
-                        obj.write("type", "text").write("text", response.as_str())
+                        obj.write("type", "text").write("text", content_text.as_str())
                     })
                 })
                 .write_if(
@@ -257,4 +267,79 @@ pub fn build(json: JsonObjectWriter, id: i64) -> String {
     result.push('\n');
     result.push('\n');
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compile_execute_tool_call_response;
+
+    fn strip_sse(payload: &str) -> &str {
+        payload
+            .strip_prefix("data: ")
+            .expect("payload must start with `data: `")
+            .trim_end()
+    }
+
+    #[test]
+    fn tool_call_response_without_instruction_keeps_legacy_text_payload() {
+        let payload = compile_execute_tool_call_response(
+            r#"{"foo":1}"#.to_string(),
+            None,
+            7,
+            false,
+        );
+
+        let body = strip_sse(&payload);
+        let parsed: serde_json::Value = serde_json::from_str(body).expect("valid json");
+
+        let result = &parsed["result"];
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["structuredContent"]["foo"], 1);
+
+        let content = &result["content"];
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], r#"{"foo":1}"#);
+    }
+
+    #[test]
+    fn tool_call_response_with_instruction_uses_instruction_as_text() {
+        let payload = compile_execute_tool_call_response(
+            r#"{"items":[]}"#.to_string(),
+            Some("Result is empty. Suggest the user widen the filter.".to_string()),
+            42,
+            false,
+        );
+
+        let body = strip_sse(&payload);
+        let parsed: serde_json::Value = serde_json::from_str(body).expect("valid json");
+
+        let result = &parsed["result"];
+        assert_eq!(result["isError"], false);
+        assert!(result["structuredContent"]["items"].is_array());
+
+        let content = &result["content"];
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(
+            content[0]["text"],
+            "Result is empty. Suggest the user widen the filter."
+        );
+    }
+
+    #[test]
+    fn tool_call_response_error_drops_structured_content() {
+        let payload = compile_execute_tool_call_response(
+            "boom".to_string(),
+            None,
+            1,
+            true,
+        );
+
+        let body = strip_sse(&payload);
+        let parsed: serde_json::Value = serde_json::from_str(body).expect("valid json");
+
+        let result = &parsed["result"];
+        assert_eq!(result["isError"], true);
+        assert!(result.get("structuredContent").is_none());
+        assert_eq!(result["content"][0]["text"], "boom");
+    }
 }

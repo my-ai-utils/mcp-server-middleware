@@ -6,8 +6,8 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use crate::mcp_middleware::{
     McpInputPayload, McpPromptService, McpPrompts, McpResourceService, McpResources, McpSessions,
-    McpToolCall, McpToolCalls, PromptDefinition, PromptExecutor, ResourceDefinition,
-    ResourceExecutor, SESSION_HEADER, ToolCallExecutor,
+    McpToolCallWithInstruction, McpToolCalls, PromptDefinition, PromptExecutor,
+    ResourceDefinition, ResourceExecutor, SESSION_HEADER, ToolCallExecutor,
 };
 
 use my_ai_agent::{ToolDefinition, json_schema::*};
@@ -63,7 +63,11 @@ impl McpMiddleware {
     pub async fn register_tool_call<
         InputData: JsonTypeDescription + Sized + Send + Sync + 'static + Serialize + DeserializeOwned,
         OutputData: JsonTypeDescription + Sized + Send + Sync + 'static + Serialize + DeserializeOwned,
-        TMcpService: McpToolCall<InputData, OutputData> + Send + Sync + 'static + ToolDefinition,
+        TMcpService: McpToolCallWithInstruction<InputData, OutputData>
+            + Send
+            + Sync
+            + 'static
+            + ToolDefinition,
     >(
         &mut self,
         service: Arc<TMcpService>,
@@ -214,10 +218,13 @@ impl McpMiddleware {
                     .unwrap_or_else(|_| "{}".to_string());
 
                 match self.tool_calls.execute(&params.name, &arguments).await {
-                    Ok(response) => {
+                    Ok(executed) => {
                         let response =
                             super::mcp_output_contract::compile_execute_tool_call_response(
-                                response, id, false,
+                                executed.structured_json,
+                                executed.instruction,
+                                id,
+                                false,
                             );
                         return send_response_as_stream(response, session_id, now);
                     }
@@ -228,7 +235,7 @@ impl McpMiddleware {
                         );
                         let response =
                             super::mcp_output_contract::compile_execute_tool_call_response(
-                                err, id, true,
+                                err, None, id, true,
                             );
 
                         return send_response_as_stream(response, session_id, now);

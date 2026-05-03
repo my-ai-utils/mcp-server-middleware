@@ -312,6 +312,60 @@ http_server.add_middleware(mcp_middleware);
 http_server.start(app_states, logger);
 ```
 
+## Returning instructions from a tool call
+
+By default a tool call returns just structured data — the model receives it via the `structuredContent` field of the `tools/call` response. Sometimes a tool wants to attach a short *inline instruction* for the model on top of the data: how to interpret the result, what to do next, what to ask the user. The middleware exposes this through `ToolCallOutput<T>` and a second trait `McpToolCallWithInstruction<Input, Output>`.
+
+`McpToolCall<Input, Output>` is unchanged — existing implementations keep working without any edits. To use the new feature, implement `McpToolCallWithInstruction` instead and return a `ToolCallOutput`:
+
+```rust
+use mcp_server_middleware::{
+    McpToolCallWithInstruction, ToolCallOutput, ToolDefinition,
+};
+
+#[async_trait::async_trait]
+impl McpToolCallWithInstruction<MyReq, MyResp> for MyHandler {
+    async fn execute_tool_call_with_instruction(
+        &self,
+        req: MyReq,
+    ) -> Result<ToolCallOutput<MyResp>, String> {
+        let resp = MyResp { items: vec![/* ... */] };
+
+        if resp.items.is_empty() {
+            return Ok(ToolCallOutput::with_instruction(
+                resp,
+                "Result is empty. Suggest the user widen the filter.",
+            ));
+        }
+
+        Ok(ToolCallOutput::new(resp))
+    }
+}
+```
+
+`ToolCallOutput` constructors:
+- `ToolCallOutput::new(data)` — data only, no instruction (equivalent to the legacy `Ok(data)` behavior).
+- `ToolCallOutput::with_instruction(data, text)` — data plus an inline instruction for the model.
+- `From<T> for ToolCallOutput<T>` is implemented, so `data.into()` works as a shortcut for `ToolCallOutput::new(data)`.
+
+`McpToolCallWithInstruction` is wired through a blanket impl over `McpToolCall`, so any existing `McpToolCall` implementation is automatically a `McpToolCallWithInstruction` that returns `ToolCallOutput::new(data)`. You only implement the new trait directly when you want to attach an instruction. Registration uses the same `register_tool_call(...)` method.
+
+### How the instruction reaches the model
+
+When a tool returns an instruction, the `tools/call` response includes both:
+
+- `result.structuredContent` — the structured `data` (same as before);
+- `result.content[0]` — `{ "type": "text", "text": "<instruction>" }`, which is the standard MCP channel models read.
+
+When `instruction` is `None`, behavior is unchanged from previous versions: `content[0].text` carries the JSON-stringified data and `structuredContent` carries the same data structurally.
+
+### Server-level instructions vs per-call instructions
+
+These are two distinct mechanisms — do not confuse them:
+
+- **Server instructions** — the `instructions` argument of `McpMiddleware::new(path, name, version, instructions)`. They are returned once during `initialize` and apply to the entire session. Use them for global guidance ("this server exposes a Postgres database, queries should be read-only").
+- **Per-call instructions** — `ToolCallOutput::with_instruction(...)`. They are returned in the response to a specific `tools/call` and are scoped to that call's context. Use them for situational hints that depend on the actual tool result ("the search returned no rows — propose to widen the filter").
+
 ## Dynamic Enum Fields
 
 For tool call parameters that need to accept values from a dynamically generated list (such as filtering by available cities, countries, or other runtime-determined options), you can use dynamic enumeration. This feature allows enum values to be generated at runtime based on your application's current data state.
