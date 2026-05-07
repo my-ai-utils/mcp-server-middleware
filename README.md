@@ -194,7 +194,7 @@ Register your service with the middleware:
 
 ```rust
 let service = Arc::new(MyToolHandler::new());
-mcp_middleware.register_tool_call(service).await;
+mcp_middleware.register_tool_call(service);
 ```
 
 ### 4. Register Prompts (Optional)
@@ -247,7 +247,7 @@ impl McpPromptService for MyPromptService {
 
 // Register the prompt
 let prompt_service = Arc::new(MyPromptService);
-mcp_middleware.register_prompt(prompt_service).await;
+mcp_middleware.register_prompt(prompt_service);
 ```
 
 ### 5. Register Resources (Optional)
@@ -295,7 +295,7 @@ impl McpResourceService for MyResourceService {
 
 // Register the resource
 let resource_service = Arc::new(MyResourceService);
-mcp_middleware.register_resource(resource_service).await;
+mcp_middleware.register_resource(resource_service);
 ```
 
 ### 6. Integrate with HTTP Server
@@ -482,7 +482,7 @@ impl McpToolCall<MyToolInputData, MyToolResponse> for MyToolHandler {
 6. **Register in your startup code**:
 
 ```rust
-mcp_middleware.register_tool_call(Arc::new(MyToolHandler::new())).await;
+mcp_middleware.register_tool_call(Arc::new(MyToolHandler::new()));
 ```
 
 ### Step-by-Step Guide for Prompts
@@ -552,7 +552,7 @@ Content here...
 4. **Register in your startup code**:
 
 ```rust
-mcp_middleware.register_prompt(Arc::new(MyPromptHandler)).await;
+mcp_middleware.register_prompt(Arc::new(MyPromptHandler));
 ```
 
 ## Complete Example: Postgres MCP Server
@@ -622,7 +622,7 @@ async fn setup_server() {
     
     // Register tool
     let service = Arc::new(PostgresMcpService::new());
-    mcp_middleware.register_tool_call(service).await;
+    mcp_middleware.register_tool_call(service);
     
     // Add to server
     let mcp_middleware = Arc::new(mcp_middleware);
@@ -866,15 +866,15 @@ let mut mcp = McpMiddleware::new(
 );
 
 // Register tools
-mcp.register_tool_call(Arc::new(Tool1Handler::new())).await;
-mcp.register_tool_call(Arc::new(Tool2Handler::new())).await;
+mcp.register_tool_call(Arc::new(Tool1Handler::new()));
+mcp.register_tool_call(Arc::new(Tool2Handler::new()));
 
 // Register prompts
-mcp.register_prompt(Arc::new(Prompt1Handler)).await;
-mcp.register_prompt(Arc::new(Prompt2Handler)).await;
+mcp.register_prompt(Arc::new(Prompt1Handler));
+mcp.register_prompt(Arc::new(Prompt2Handler));
 
 // Register resources
-mcp.register_resource(Arc::new(Resource1Handler)).await;
+mcp.register_resource(Arc::new(Resource1Handler));
 
 // Add to HTTP server
 let mcp = Arc::new(mcp);

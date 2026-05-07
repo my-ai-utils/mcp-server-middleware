@@ -43,7 +43,7 @@ pub async fn stream_updates(
         };
 
         if producer.send(frame).await.is_err() {
-            sessions.clear_sender(session_id.as_str()).await;
+            sessions.clear_sender(session_id.as_str());
             return;
         }
     }

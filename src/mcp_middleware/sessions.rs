@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
+use parking_lot::Mutex;
 use rust_extensions::date_time::DateTimeAsMicroseconds;
-use tokio::sync::Mutex;
 
 use crate::mcp_middleware::McpSocketUpdateEvent;
 
@@ -33,10 +33,10 @@ impl McpSessions {
         }
     }
 
-    pub async fn generate_session(&self, version: String, now: DateTimeAsMicroseconds) -> String {
+    pub fn generate_session(&self, version: String, now: DateTimeAsMicroseconds) -> String {
         let id = uuid::Uuid::new_v4().to_string();
 
-        let mut write_access = self.data.lock().await;
+        let mut write_access = self.data.lock();
 
         write_access.insert(
             id.to_string(),
@@ -51,23 +51,23 @@ impl McpSessions {
         id
     }
 
-    pub async fn subscribe_to_notifications(
+    pub fn subscribe_to_notifications(
         &self,
         session_id: &str,
     ) -> Option<tokio::sync::mpsc::Receiver<McpSocketUpdateEvent>> {
-        let mut write_access = self.data.lock().await;
+        let mut write_access = self.data.lock();
         let session = write_access.get_mut(session_id)?;
         let (sender, receiver) = tokio::sync::mpsc::channel(32);
         session.sender = Some(sender);
         Some(receiver)
     }
 
-    pub async fn check_session_and_update_last_used(
+    pub fn check_session_and_update_last_used(
         &self,
         session_id: &str,
         now: DateTimeAsMicroseconds,
     ) -> bool {
-        let mut write_access = self.data.lock().await;
+        let mut write_access = self.data.lock();
 
         if let Some(session) = write_access.get_mut(session_id) {
             session.last_access = now;
@@ -77,13 +77,13 @@ impl McpSessions {
         false
     }
 
-    pub async fn delete_session(&self, session_id: &str) -> bool {
-        let mut write_access = self.data.lock().await;
+    pub fn delete_session(&self, session_id: &str) -> bool {
+        let mut write_access = self.data.lock();
         write_access.remove(session_id).is_some()
     }
 
-    pub async fn clear_sender(&self, session_id: &str) {
-        let mut write_access = self.data.lock().await;
+    pub fn clear_sender(&self, session_id: &str) {
+        let mut write_access = self.data.lock();
         if let Some(session) = write_access.get_mut(session_id) {
             session.sender = None;
         }
@@ -91,7 +91,7 @@ impl McpSessions {
 
     pub async fn broadcast(&self, event: McpSocketUpdateEvent) {
         let senders: Vec<_> = {
-            let read_access = self.data.lock().await;
+            let read_access = self.data.lock();
             read_access
                 .values()
                 .filter_map(|s| s.sender.clone())

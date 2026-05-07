@@ -37,11 +37,11 @@ impl McpPrompts {
         Err(format!("Prompt with name {} is not found", prompt_name))
     }
 
-    pub async fn get_list(&self) -> Vec<PromptSchemaData> {
+    pub fn get_list(&self) -> Vec<PromptSchemaData> {
         let mut result = Vec::with_capacity(self.prompts.len());
 
         for prompt in self.prompts.values() {
-            let argument_descriptions = prompt.get_argument_descriptions().await;
+            let argument_descriptions = prompt.get_argument_descriptions();
 
             result.push(PromptSchemaData {
                 prompt: prompt.clone(),

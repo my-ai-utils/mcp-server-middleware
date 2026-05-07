@@ -23,7 +23,7 @@ impl McpPromptAbstract for PromptExecutor {
         &self.description
     }
 
-    async fn get_argument_descriptions(&self) -> Vec<super::PromptArgumentDescription> {
+    fn get_argument_descriptions(&self) -> Vec<super::PromptArgumentDescription> {
         self.argument_descriptions.clone()
     }
 

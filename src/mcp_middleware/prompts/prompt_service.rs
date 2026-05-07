@@ -26,5 +26,5 @@ pub trait McpPromptAbstract {
 
     fn get_prompt_name(&self) -> &str;
     fn get_description(&self) -> &str;
-    async fn get_argument_descriptions(&self) -> Vec<super::PromptArgumentDescription>;
+    fn get_argument_descriptions(&self) -> Vec<super::PromptArgumentDescription>;
 }

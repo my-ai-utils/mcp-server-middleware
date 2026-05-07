@@ -60,7 +60,7 @@ impl McpMiddleware {
             .await;
     }
 
-    pub async fn register_tool_call<
+    pub fn register_tool_call<
         InputData: JsonTypeDescription + Sized + Send + Sync + 'static + Serialize + DeserializeOwned,
         OutputData: JsonTypeDescription + Sized + Send + Sync + 'static + Serialize + DeserializeOwned,
         TMcpService: McpToolCallWithInstruction<InputData, OutputData>
@@ -81,7 +81,7 @@ impl McpMiddleware {
         self.tool_calls.add(Arc::new(executor));
     }
 
-    pub async fn register_prompt<
+    pub fn register_prompt<
         TMcpPromptService: McpPromptService + Send + Sync + 'static + PromptDefinition,
     >(
         &mut self,
@@ -97,7 +97,7 @@ impl McpMiddleware {
         self.prompts.add(Arc::new(executor));
     }
 
-    pub async fn register_resource<
+    pub fn register_resource<
         TMcpResourceService: McpResourceService + Send + Sync + 'static + ResourceDefinition,
     >(
         &mut self,
@@ -146,15 +146,14 @@ impl McpMiddleware {
 
                 let session_id = self
                     .sessions
-                    .generate_session(contract.protocol_version, now)
-                    .await;
+                    .generate_session(contract.protocol_version, now);
 
                 return send_response_as_stream(response, session_id.as_str(), now);
             }
 
             super::McpInputData::ResourcesList(params) => {
                 let (list, next_cursor) =
-                    self.resources.get_list(params.cursor.as_deref()).await;
+                    self.resources.get_list(params.cursor.as_deref());
                 let response = super::mcp_output_contract::compile_resources_list(
                     list,
                     id,
@@ -251,7 +250,7 @@ impl McpMiddleware {
             }
 
             super::McpInputData::PromptsList => {
-                let list = self.prompts.get_list().await;
+                let list = self.prompts.get_list();
                 let response = super::mcp_output_contract::compile_prompts_list(list, id);
 
                 return send_response_as_stream(response, session_id, now);
@@ -326,7 +325,6 @@ impl McpMiddleware {
             if !self
                 .sessions
                 .check_session_and_update_last_used(session_id, now)
-                .await
             {
                 return HttpOutput::as_unauthorized(None).into_err(false, false);
             }
@@ -353,8 +351,7 @@ impl McpMiddleware {
 
                 let session_id = self
                     .sessions
-                    .generate_session(contract.protocol_version, now)
-                    .await;
+                    .generate_session(contract.protocol_version, now);
 
                 send_response_as_stream(response, session_id.as_str(), now)
             }
@@ -452,7 +449,6 @@ impl HttpServerMiddleware for McpMiddleware {
                 if let Some(receiver) = self
                     .sessions
                     .subscribe_to_notifications(session_id.as_str())
-                    .await
                 {
                     let (stream, producer) = HttpOutput::as_stream(32);
                     tokio::spawn(super::stream_updates(
@@ -490,7 +486,7 @@ impl HttpServerMiddleware for McpMiddleware {
                     );
                 };
 
-                let removed = self.sessions.delete_session(session_id.as_str()).await;
+                let removed = self.sessions.delete_session(session_id.as_str());
 
                 if !removed {
                     return Some(

@@ -33,7 +33,7 @@ impl McpResources {
         Err(format!("Resource with URI {} is not found", uri))
     }
 
-    pub async fn get_list(
+    pub fn get_list(
         &self,
         cursor: Option<&str>,
     ) -> (Vec<ResourceSchemaData>, Option<String>) {
