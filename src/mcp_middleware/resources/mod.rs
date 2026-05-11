@@ -6,3 +6,7 @@ mod resource_executor;
 pub use resource_executor::*;
 mod resources_manager;
 pub use resources_manager::*;
+mod dynamic_resource_executor;
+pub use dynamic_resource_executor::*;
+mod dynamic_resources;
+pub use dynamic_resources::*;

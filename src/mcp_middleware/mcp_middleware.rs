@@ -5,9 +5,10 @@ use rust_extensions::date_time::DateTimeAsMicroseconds;
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::mcp_middleware::{
-    McpInputPayload, McpPromptService, McpPrompts, McpResourceService, McpResources, McpSessions,
-    McpToolCallWithInstruction, McpToolCalls, PromptDefinition, PromptExecutor,
-    ResourceDefinition, ResourceExecutor, SESSION_HEADER, ToolCallExecutor,
+    DynamicResourceExecutor, DynamicResources, McpInputPayload, McpPromptService, McpPrompts,
+    McpResourceService, McpResources, McpSessions, McpToolCallWithInstruction, McpToolCalls,
+    PromptDefinition, PromptExecutor, ResourceDefinition, ResourceExecutor, ResourceIcon,
+    SESSION_HEADER, ToolCallExecutor,
 };
 
 use my_ai_agent::{ToolDefinition, json_schema::*};
@@ -21,6 +22,10 @@ pub struct McpMiddleware {
     tool_calls: McpToolCalls,
     prompts: McpPrompts,
     resources: McpResources,
+    /// Runtime-registered resources. Static resources go through
+    /// `resources`; this registry serves URIs minted after `new()`
+    /// (e.g. one resource per downloaded Telegram media item).
+    dynamic_resources: Arc<tokio::sync::RwLock<DynamicResources>>,
 }
 
 impl McpMiddleware {
@@ -39,6 +44,7 @@ impl McpMiddleware {
             tool_calls: McpToolCalls::new(),
             prompts: McpPrompts::new(),
             resources: McpResources::new(),
+            dynamic_resources: Arc::new(tokio::sync::RwLock::new(DynamicResources::new())),
         }
     }
 
@@ -122,6 +128,63 @@ impl McpMiddleware {
         self.resources.add(Arc::new(executor));
     }
 
+    /// Register a resource minted at runtime. URI is whatever caller
+    /// chooses (commonly `scheme://path/{id}`). Idempotent: registering
+    /// the same URI twice overwrites the previous entry. Use
+    /// [`Self::unregister_dynamic_resource`] for explicit removal and
+    /// [`Self::notify_resources_changed`] to push the update to live
+    /// MCP sessions.
+    pub async fn register_dynamic_resource(
+        &self,
+        uri: String,
+        name: String,
+        description: String,
+        mime_type: String,
+        service: Arc<dyn McpResourceService + Send + Sync + 'static>,
+    ) {
+        self.register_dynamic_resource_full(
+            uri, name, description, mime_type, None, None, Vec::new(), service,
+        )
+        .await
+    }
+
+    /// Same as [`Self::register_dynamic_resource`] but lets callers set
+    /// the optional `title`, `size`, and `icons` metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_dynamic_resource_full(
+        &self,
+        uri: String,
+        name: String,
+        description: String,
+        mime_type: String,
+        title: Option<String>,
+        size: Option<u64>,
+        icons: Vec<ResourceIcon>,
+        service: Arc<dyn McpResourceService + Send + Sync + 'static>,
+    ) {
+        let executor = DynamicResourceExecutor {
+            resource_uri: uri,
+            resource_name: name,
+            description,
+            mime_type,
+            title,
+            size,
+            icons,
+            holder: service,
+        };
+        let mut w = self.dynamic_resources.write().await;
+        w.add(Arc::new(executor));
+    }
+
+    /// Drop a dynamic resource. Returns true if a resource with that
+    /// URI was actually present. Callers that want clients to refresh
+    /// their resource list should follow up with
+    /// [`Self::notify_resources_changed`].
+    pub async fn unregister_dynamic_resource(&self, uri: &str) -> bool {
+        let mut w = self.dynamic_resources.write().await;
+        w.remove(uri)
+    }
+
     async fn handle_authorized_request(
         &self,
         session_id: &str,
@@ -133,6 +196,9 @@ impl McpMiddleware {
             super::McpInputData::Initialize(contract) => {
                 //println!("Initializing {:?}", contract);
 
+                let has_resources = self.resources.has_resources()
+                    || self.dynamic_resources.read().await.has_resources();
+
                 let response = super::mcp_output_contract::compile_init_response(
                     &self.name,
                     &self.version,
@@ -140,7 +206,7 @@ impl McpMiddleware {
                     &contract.protocol_version,
                     id,
                     self.tool_calls.has_tools(),
-                    self.resources.has_resources(),
+                    has_resources,
                     self.prompts.has_prompts(),
                 );
 
@@ -152,8 +218,18 @@ impl McpMiddleware {
             }
 
             super::McpInputData::ResourcesList(params) => {
-                let (list, next_cursor) =
+                let (mut list, next_cursor) =
                     self.resources.get_list(params.cursor.as_deref());
+
+                // Append every dynamic resource. Pagination cursor is
+                // driven by the static registry; once the static list
+                // is exhausted (next_cursor = None) we surface the
+                // dynamic ones on the same page.
+                if next_cursor.is_none() {
+                    let guard = self.dynamic_resources.read().await;
+                    list.extend(guard.list());
+                }
+
                 let response = super::mcp_output_contract::compile_resources_list(
                     list,
                     id,
@@ -166,7 +242,15 @@ impl McpMiddleware {
             super::McpInputData::ReadResource(params) => {
                 //println!("Reading resource with URI: {:?}", params.uri);
 
-                match self.resources.read(&params.uri).await {
+                let read_result = match self.resources.read(&params.uri).await {
+                    Ok(r) => Ok(r),
+                    Err(_) => {
+                        let guard = self.dynamic_resources.read().await;
+                        guard.read(&params.uri).await
+                    }
+                };
+
+                match read_result {
                     Ok(response) => {
                         let response = super::mcp_output_contract::compile_read_resource_response(
                             response, id,
@@ -187,7 +271,15 @@ impl McpMiddleware {
             super::McpInputData::SubscribeResource(params) => {
               //  println!("Subscribing to resource with URI: {:?}", params.uri);
 
-                match self.resources.read(&params.uri).await {
+                let read_result = match self.resources.read(&params.uri).await {
+                    Ok(r) => Ok(r),
+                    Err(_) => {
+                        let guard = self.dynamic_resources.read().await;
+                        guard.read(&params.uri).await
+                    }
+                };
+
+                match read_result {
                     Ok(response) => {
                         // Return the initial version of the resource
                         // Note: We're not implementing updates, just returning the first version
@@ -338,6 +430,9 @@ impl McpMiddleware {
             super::McpInputData::Initialize(contract) => {
                 //println!("Initializing {:?}", contract);
 
+                let has_resources = self.resources.has_resources()
+                    || self.dynamic_resources.read().await.has_resources();
+
                 let response = super::mcp_output_contract::compile_init_response(
                     &self.name,
                     &self.version,
@@ -345,7 +440,7 @@ impl McpMiddleware {
                     &contract.protocol_version,
                     id,
                     self.tool_calls.has_tools(),
-                    self.resources.has_resources(),
+                    has_resources,
                     self.prompts.has_prompts(),
                 );
 
