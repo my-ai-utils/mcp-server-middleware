@@ -59,7 +59,8 @@ This middleware (`mcp-server-middleware`) is a **Rust library** that provides a 
 - `ToolDefinition`: Trait for providing tool metadata (name, description)
 - `McpPromptService`: Trait for implementing prompt templates
 - `PromptDefinition`: Trait for providing prompt metadata
-- `ResourceDefinition` & `McpResourceService`: Traits for resource management
+- `ResourceDefinition` & `McpResourceService`: Traits for resource management (static, compile-time URIs)
+- Dynamic resource registry: register/unregister resources with runtime URIs after the middleware is mounted
 
 **Type Safety**:
 - Automatic JSON schema generation from Rust types using `ApplyJsonSchema` macro
@@ -84,6 +85,7 @@ This middleware (`mcp-server-middleware`) is a **Rust library** that provides a 
 - Session-based security - each client gets isolated session
 - Streaming support - real-time updates via SSE
 - Resource pagination - efficient handling of large resource lists
+- Dynamic resources - register/unregister resources at runtime (e.g. one per uploaded file or generated artifact), served as `blob` (base64) or `text`
 - Prompt templates - reusable prompts with variable substitution
 
 ## Features
@@ -297,6 +299,92 @@ impl McpResourceService for MyResourceService {
 let resource_service = Arc::new(MyResourceService);
 mcp_middleware.register_resource(resource_service);
 ```
+
+### 5b. Register Dynamic Resources (Runtime)
+
+`ResourceDefinition` pins the URI to a `const &'static str`, so it can
+only describe resources known at compile time. For resources minted at
+runtime — one per uploaded file, per database row, per generated
+artifact — use the dynamic registry. The middleware keeps it behind a
+`RwLock`, so you can register/unregister even after the middleware is
+wrapped in `Arc` and mounted on the HTTP server. `resources/list`,
+`resources/read`, `resources/subscribe`, and the `initialize`
+capability advertisement all fan out across both the static and the
+dynamic registries.
+
+```rust
+use mcp_server_middleware::{McpResourceService, ResourceReadResult, ResourceContent};
+use async_trait::async_trait;
+use std::sync::Arc;
+
+pub struct BlobResource {
+    uri: String,
+    bytes_base64: String,
+    mime_type: String,
+}
+
+#[async_trait]
+impl McpResourceService for BlobResource {
+    async fn read_resource(&self) -> Result<ResourceReadResult, String> {
+        Ok(ResourceReadResult {
+            contents: vec![ResourceContent {
+                uri: self.uri.clone(),
+                mime_type: self.mime_type.clone(),
+                text: None,
+                blob: Some(self.bytes_base64.clone()), // base64-encoded payload
+            }],
+        })
+    }
+}
+
+// `mcp_middleware: Arc<McpMiddleware>` — fine to call after it's mounted.
+let uri = format!("app://blob/{id}");
+let svc = Arc::new(BlobResource {
+    uri: uri.clone(),
+    bytes_base64,
+    mime_type: "image/png".to_string(),
+});
+
+// Minimal form:
+mcp_middleware
+    .register_dynamic_resource(
+        uri.clone(),
+        "blob name".to_string(),
+        "Generated blob".to_string(),
+        "image/png".to_string(),
+        svc.clone(),
+    )
+    .await;
+
+// Or with optional title / size / icons:
+mcp_middleware
+    .register_dynamic_resource_full(
+        uri.clone(),
+        "blob name".to_string(),
+        "Generated blob".to_string(),
+        "image/png".to_string(),
+        Some("Blob Title".to_string()),
+        Some(4096),       // size in bytes
+        Vec::new(),       // icons
+        svc,
+    )
+    .await;
+
+// Push the change to live MCP sessions:
+mcp_middleware.notify_resources_changed().await;
+
+// Remove it later (true if it was present):
+let _ = mcp_middleware.unregister_dynamic_resource(&uri).await;
+```
+
+Notes:
+- Registering the same URI twice overwrites the previous entry.
+- The dynamic registry is unpaginated; `resources/list` surfaces every
+  dynamic resource on the page after the static ones are exhausted.
+  Intended for "tens to low thousands" of entries.
+- Returning `blob` (base64) with an image MIME type lets MCP clients
+  render the resource as an image content block — the right channel for
+  binary payloads, instead of stuffing base64 into tool-call JSON.
 
 ### 6. Integrate with HTTP Server
 
@@ -667,6 +755,34 @@ Registers a prompt service. The service must implement:
   * `DESCRIPTION`: Human-readable description (const)
   * `get_argument_descriptions()`: Returns `Vec<PromptArgumentDescription>` with argument metadata
 
+#### `register_resource(service)`
+
+Registers a static resource whose URI is known at compile time. The
+service must implement `ResourceDefinition` (provides `RESOURCE_URI`,
+`RESOURCE_NAME`, `DESCRIPTION`, `MIME_TYPE` consts plus optional
+`get_title` / `get_size` / `get_icons`) and `McpResourceService`
+(provides `read_resource`).
+
+#### `register_dynamic_resource(uri, name, description, mime_type, service)` *(async)*
+
+Registers a resource minted at runtime. URI is a `String` chosen by the
+caller. Only the service's `McpResourceService` impl is needed —
+`ResourceDefinition` is not. Idempotent: re-registering the same URI
+overwrites the previous entry. Backed by a `RwLock`, so it's safe to
+call after the middleware is wrapped in `Arc` and mounted.
+
+#### `register_dynamic_resource_full(uri, name, description, mime_type, title, size, icons, service)` *(async)*
+
+Same as `register_dynamic_resource` but accepts the optional
+`title: Option<String>`, `size: Option<u64>`, and `icons: Vec<ResourceIcon>`
+metadata.
+
+#### `unregister_dynamic_resource(uri)` *(async)*
+
+Removes a dynamic resource. Returns `true` if a resource with that URI
+was present. Follow up with `notify_resources_changed()` so clients
+refresh their resource list.
+
 ### `McpToolCall` Trait
 
 Trait that must be implemented by your tool services:
@@ -873,12 +989,17 @@ mcp.register_tool_call(Arc::new(Tool2Handler::new()));
 mcp.register_prompt(Arc::new(Prompt1Handler));
 mcp.register_prompt(Arc::new(Prompt2Handler));
 
-// Register resources
+// Register static resources
 mcp.register_resource(Arc::new(Resource1Handler));
 
 // Add to HTTP server
 let mcp = Arc::new(mcp);
-http_server.add_middleware(mcp);
+http_server.add_middleware(mcp.clone());
+
+// Dynamic resources can be registered any time after this, e.g. from
+// a tool handler that just produced an artifact:
+// mcp.register_dynamic_resource(uri, name, desc, mime, svc).await;
+// mcp.notify_resources_changed().await;
 ```
 
 ## Use Cases
