@@ -5,10 +5,11 @@ use rust_extensions::date_time::DateTimeAsMicroseconds;
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::mcp_middleware::{
-    DynamicResourceExecutor, DynamicResources, McpInputPayload, McpPromptService, McpPrompts,
-    McpResourceService, McpResources, McpSessions, McpToolCallWithInstruction, McpToolCalls,
-    PromptDefinition, PromptExecutor, ResourceDefinition, ResourceExecutor, ResourceIcon,
-    SESSION_HEADER, ToolCallExecutor,
+    DynamicResourceExecutor, DynamicResources, McpElicitations, McpInputPayload, McpPromptService,
+    McpPrompts, McpResourceService, McpResources, McpSessions, McpToolCallEx,
+    McpToolCallWithInstruction, McpToolCalls, PromptDefinition, PromptExecutor, ResourceDefinition,
+    ResourceExecutor, ResourceIcon, SESSION_HEADER, ToolCallContext, ToolCallExecutor,
+    ToolCallExecutorEx, parse_elicitation_response,
 };
 
 use my_ai_agent::{ToolDefinition, json_schema::*};
@@ -26,6 +27,10 @@ pub struct McpMiddleware {
     /// `resources`; this registry serves URIs minted after `new()`
     /// (e.g. one resource per downloaded Telegram media item).
     dynamic_resources: Arc<tokio::sync::RwLock<DynamicResources>>,
+    /// Registry of in-flight server→client `elicitation/create`
+    /// requests. Tools opted into [`McpToolCallEx`] reach this through
+    /// the [`ToolCallContext`] supplied at execute-time.
+    elicitations: Arc<McpElicitations>,
 }
 
 impl McpMiddleware {
@@ -45,6 +50,7 @@ impl McpMiddleware {
             prompts: McpPrompts::new(),
             resources: McpResources::new(),
             dynamic_resources: Arc::new(tokio::sync::RwLock::new(DynamicResources::new())),
+            elicitations: Arc::new(McpElicitations::new()),
         }
     }
 
@@ -79,6 +85,26 @@ impl McpMiddleware {
         service: Arc<TMcpService>,
     ) {
         let executor: ToolCallExecutor<InputData, OutputData> = ToolCallExecutor {
+            fn_name: TMcpService::FUNC_NAME,
+            description: TMcpService::DESCRIPTION,
+            holder: service,
+        };
+
+        self.tool_calls.add(Arc::new(executor));
+    }
+
+    /// Same as [`Self::register_tool_call`] but for tools that need
+    /// access to a [`ToolCallContext`] (server→client elicitation,
+    /// session metadata, etc.). The tool implements [`McpToolCallEx`].
+    pub fn register_tool_call_with_context<
+        InputData: JsonTypeDescription + Sized + Send + Sync + 'static + Serialize + DeserializeOwned,
+        OutputData: JsonTypeDescription + Sized + Send + Sync + 'static + Serialize + DeserializeOwned,
+        TMcpService: McpToolCallEx<InputData, OutputData> + Send + Sync + 'static + ToolDefinition,
+    >(
+        &mut self,
+        service: Arc<TMcpService>,
+    ) {
+        let executor: ToolCallExecutorEx<InputData, OutputData> = ToolCallExecutorEx {
             fn_name: TMcpService::FUNC_NAME,
             description: TMcpService::DESCRIPTION,
             holder: service,
@@ -210,9 +236,12 @@ impl McpMiddleware {
                     self.prompts.has_prompts(),
                 );
 
-                let session_id = self
-                    .sessions
-                    .generate_session(contract.protocol_version, now);
+                let supports_elicitation = contract.capabilities.elicitation.is_some();
+                let session_id = self.sessions.generate_session(
+                    contract.protocol_version,
+                    now,
+                    supports_elicitation,
+                );
 
                 return send_response_as_stream(response, session_id.as_str(), now);
             }
@@ -308,7 +337,20 @@ impl McpMiddleware {
                 let arguments = serde_json::to_string(&params.arguments)
                     .unwrap_or_else(|_| "{}".to_string());
 
-                match self.tool_calls.execute(&params.name, &arguments).await {
+                let ctx = ToolCallContext {
+                    session_id: session_id.to_string(),
+                    supports_elicitation: self
+                        .sessions
+                        .session_supports_elicitation(session_id),
+                    elicitations: self.elicitations.clone(),
+                    sessions: self.sessions.clone(),
+                };
+
+                match self
+                    .tool_calls
+                    .execute(&params.name, &arguments, ctx)
+                    .await
+                {
                     Ok(executed) => {
                         let response =
                             super::mcp_output_contract::compile_execute_tool_call_response(
@@ -380,6 +422,20 @@ impl McpMiddleware {
                     .set_status_code(202)
                     .into_ok_result(false);
             }
+            super::McpInputData::ServerResponse {
+                result_json,
+                error_json,
+            } => {
+                let response = parse_elicitation_response(
+                    result_json.as_deref(),
+                    error_json.as_deref(),
+                );
+                self.elicitations.resolve(id, response);
+                return HttpOutput::from_builder()
+                    .add_header("date", now.to_rfc7231())
+                    .set_status_code(202)
+                    .into_ok_result(false);
+            }
             super::McpInputData::Other { method, data } => {
                 println!("Unsupported method: {}. Data: `{}`", method, data);
                 return HttpOutput::as_fatal_error(format!(
@@ -444,9 +500,12 @@ impl McpMiddleware {
                     self.prompts.has_prompts(),
                 );
 
-                let session_id = self
-                    .sessions
-                    .generate_session(contract.protocol_version, now);
+                let supports_elicitation = contract.capabilities.elicitation.is_some();
+                let session_id = self.sessions.generate_session(
+                    contract.protocol_version,
+                    now,
+                    supports_elicitation,
+                );
 
                 send_response_as_stream(response, session_id.as_str(), now)
             }

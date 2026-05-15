@@ -98,6 +98,7 @@ This middleware (`mcp-server-middleware`) is a **Rust library** that provides a 
 * **HTTP Integration**: Seamless integration with `my-http-server` as middleware
 * **Type-Safe Tool Definitions**: Leverages `my-ai-agent` for type-safe JSON schema generation
 * **Dynamic Enumeration**: Support for dynamically generated enum values based on runtime data
+* **Elicitation** (server→client user input): tools that implement `McpToolCallEx` can request a value from the user mid-execution via `ToolCallContext::elicit()`. Requires the client to advertise `capabilities.elicitation` at initialize. Useful for credentials and confirmations that should never enter the LLM context.
 
 ## Installation
 

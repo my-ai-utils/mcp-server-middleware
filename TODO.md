@@ -10,7 +10,7 @@
 - [ ] **`notifications/progress`** — для долгих tool-вызовов клиент посылает `progressToken` в `params._meta.progressToken`. Сейчас он игнорируется. Нужно: пробросить токен в `McpToolCall::execute_tool_call` (через контекст-аргумент), завести `ProgressReporter`, который шлёт `notifications/progress` в SSE сессии-инициатора.
 - [ ] **`completion/complete`** — auto-completion для аргументов prompts/resources. Не реализовано вообще.
 - [ ] **`roots/list` + `notifications/roots/list_changed`** — клиент-side concept, но сервер должен уметь спросить. Опционально, если хотим инициировать с сервера.
-- [ ] **`elicitation/create`** — server→client запрос на ввод данных. Опционально, новая фича спеки.
+- [x] **`elicitation/create`** — реализован в 0.9.0. Tool implements `McpToolCallEx` и зовёт `ctx.elicit(message, schema, timeout)`. Клиент должен заявить `capabilities.elicitation: {}` при initialize, иначе `elicit()` возвращает ошибку. Подробности: [stream_updates.rs](src/mcp_middleware/stream_updates.rs), [elicitations.rs](src/mcp_middleware/elicitations.rs), [tool_call_context.rs](src/mcp_middleware/tool_calls/tool_call_context.rs).
 - [ ] **Sampling (`sampling/createMessage`)** — server→client LLM-запрос. Опционально, для агентских сценариев.
 - [ ] **`_meta` / `cursor` / `progressToken`** — сейчас вырезаются на парсинге. Должны проходить сквозняком и быть доступны хендлерам.
 - [ ] **JSON-RPC batch requests** — `try_parse` ждёт один объект, не массив. Спека требует поддержку батчей.

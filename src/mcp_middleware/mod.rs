@@ -2,6 +2,8 @@ mod stream_updates;
 pub use stream_updates::*;
 mod sessions;
 pub use sessions::*;
+mod elicitations;
+pub use elicitations::*;
 mod mcp_payload;
 pub use mcp_payload::*;
 mod mcp_output_contract;

@@ -14,6 +14,13 @@ pub enum McpInputData {
     ExecuteToolCall(ExecuteToolCallModel),
     GetPrompt(GetPromptModel),
     Ping,
+    /// Server-originated request response sent back by the client
+    /// (used for `elicitation/create` responses). Either `result_json`
+    /// or `error_json` is populated, never both.
+    ServerResponse {
+        result_json: Option<String>,
+        error_json: Option<String>,
+    },
     Other { method: String, data: String },
 }
 
@@ -129,6 +136,8 @@ impl McpInputPayload {
         let mut method = None;
         let mut id: Option<i64> = None;
         let mut params = None;
+        let mut result_json: Option<String> = None;
+        let mut error_json: Option<String> = None;
 
         while let Some(item) = json_iterator.get_next() {
             let (name, value) = item.map_err(|err| format!("{:?}", err))?;
@@ -156,6 +165,12 @@ impl McpInputPayload {
                 "params" => {
                     params = value.map(|v| v.to_string());
                 }
+                "result" => {
+                    result_json = value.map(|v| v.to_string());
+                }
+                "error" => {
+                    error_json = value.map(|v| v.to_string());
+                }
                 _ => {}
             }
         }
@@ -163,6 +178,20 @@ impl McpInputPayload {
         let Some(version) = version else {
             return Err("Version is null".to_string());
         };
+
+        // JSON-RPC response (no `method`, has `id` and `result`/`error`) →
+        // routed to ServerResponse so the middleware can resolve the
+        // matching pending server-initiated request (e.g. elicitation).
+        if method.is_none() && id.is_some() && (result_json.is_some() || error_json.is_some()) {
+            return Ok(Self {
+                _version: version.to_string(),
+                id: id.unwrap_or_default(),
+                data: McpInputData::ServerResponse {
+                    result_json,
+                    error_json,
+                },
+            });
+        }
 
         let Some(method) = method else {
             return Err("Method is null".to_string());
@@ -185,6 +214,19 @@ impl McpInputPayload {
 pub struct InitializeMpcContract {
     #[serde(rename = "protocolVersion")]
     pub protocol_version: String,
+    #[serde(default)]
+    pub capabilities: ClientCapabilities,
+}
+
+/// Subset of client capabilities the server cares about. Unknown fields
+/// in the wire payload are silently dropped.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct ClientCapabilities {
+    /// Presence of this field (any JSON value) signals that the client
+    /// supports `elicitation/create`. The MCP spec advertises elicitation
+    /// support as `{"elicitation": {}}` in client capabilities.
+    #[serde(default)]
+    pub elicitation: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -198,5 +240,57 @@ mod tests {
         let mpc_payload = McpInputPayload::try_parse(init_payload.as_bytes()).unwrap();
 
         println!("Mcp Payload: {:?}", mpc_payload);
+    }
+
+    #[test]
+    fn initialize_picks_up_elicitation_capability() {
+        let payload = r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-06-18","capabilities":{"elicitation":{}},"clientInfo":{"name":"claude-code","version":"0.5.0"}}}"#;
+        let parsed = McpInputPayload::try_parse(payload.as_bytes()).unwrap();
+        match parsed.data {
+            McpInputData::Initialize(c) => {
+                assert!(c.capabilities.elicitation.is_some(),
+                    "elicitation capability not picked up");
+            }
+            other => panic!("expected Initialize, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn initialize_without_elicitation_capability() {
+        let payload = r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-06-18","capabilities":{}}}"#;
+        let parsed = McpInputPayload::try_parse(payload.as_bytes()).unwrap();
+        match parsed.data {
+            McpInputData::Initialize(c) => assert!(c.capabilities.elicitation.is_none()),
+            other => panic!("expected Initialize, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_jsonrpc_response_routes_to_server_response() {
+        let payload = r#"{"jsonrpc":"2.0","id":-1,"result":{"action":"accept","content":{"password":"x"}}}"#;
+        let parsed = McpInputPayload::try_parse(payload.as_bytes()).unwrap();
+        assert_eq!(parsed.id, -1);
+        match parsed.data {
+            McpInputData::ServerResponse { result_json, error_json } => {
+                assert!(error_json.is_none());
+                let result_json = result_json.expect("result_json must be present");
+                assert!(result_json.contains("\"accept\""));
+                assert!(result_json.contains("\"password\""));
+            }
+            other => panic!("expected ServerResponse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_jsonrpc_error_response_routes_to_server_response() {
+        let payload = r#"{"jsonrpc":"2.0","id":-2,"error":{"code":-32000,"message":"user cancelled"}}"#;
+        let parsed = McpInputPayload::try_parse(payload.as_bytes()).unwrap();
+        match parsed.data {
+            McpInputData::ServerResponse { result_json, error_json } => {
+                assert!(result_json.is_none());
+                assert!(error_json.is_some());
+            }
+            other => panic!("expected ServerResponse, got {:?}", other),
+        }
     }
 }

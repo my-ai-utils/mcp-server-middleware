@@ -10,6 +10,10 @@ pub struct McpSession {
     pub create: DateTimeAsMicroseconds,
     pub last_access: DateTimeAsMicroseconds,
     pub sender: Option<tokio::sync::mpsc::Sender<McpSocketUpdateEvent>>,
+    /// Set from the client's `capabilities.elicitation` at initialize
+    /// time. Tools query this through `ToolCallContext` to decide
+    /// whether to attempt `elicitation/create`.
+    pub supports_elicitation: bool,
 }
 
 impl Drop for McpSession {
@@ -33,7 +37,12 @@ impl McpSessions {
         }
     }
 
-    pub fn generate_session(&self, version: String, now: DateTimeAsMicroseconds) -> String {
+    pub fn generate_session(
+        &self,
+        version: String,
+        now: DateTimeAsMicroseconds,
+        supports_elicitation: bool,
+    ) -> String {
         let id = uuid::Uuid::new_v4().to_string();
 
         let mut write_access = self.data.lock();
@@ -45,10 +54,30 @@ impl McpSessions {
                 create: now,
                 last_access: now,
                 sender: None,
+                supports_elicitation,
             },
         );
 
         id
+    }
+
+    pub fn session_supports_elicitation(&self, session_id: &str) -> bool {
+        let access = self.data.lock();
+        access
+            .get(session_id)
+            .map(|s| s.supports_elicitation)
+            .unwrap_or(false)
+    }
+
+    /// Returns the SSE sender for the session, if any. Caller uses
+    /// this to push targeted events (e.g. `elicitation/create`) to a
+    /// single client rather than broadcasting.
+    pub fn get_sender(
+        &self,
+        session_id: &str,
+    ) -> Option<tokio::sync::mpsc::Sender<McpSocketUpdateEvent>> {
+        let access = self.data.lock();
+        access.get(session_id).and_then(|s| s.sender.clone())
     }
 
     pub fn subscribe_to_notifications(

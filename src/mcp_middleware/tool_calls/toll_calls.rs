@@ -1,6 +1,7 @@
 use my_ai_agent::my_json;
 
 use super::*;
+use crate::mcp_middleware::ToolCallContext;
 use std::{collections::BTreeMap, sync::Arc};
 
 pub struct ToolCallSchemaData {
@@ -25,9 +26,14 @@ impl McpToolCalls {
         self.tool_calls.insert(name, executor);
     }
 
-    pub async fn execute(&self, fn_name: &str, input: &str) -> Result<ExecutedToolCall, String> {
+    pub async fn execute(
+        &self,
+        fn_name: &str,
+        input: &str,
+        ctx: ToolCallContext,
+    ) -> Result<ExecutedToolCall, String> {
         if let Some(executor) = self.tool_calls.get(fn_name) {
-            return executor.execute(input).await;
+            return executor.execute(input, ctx).await;
         }
 
         Err(format!("Tool call with name {} is not found", fn_name))

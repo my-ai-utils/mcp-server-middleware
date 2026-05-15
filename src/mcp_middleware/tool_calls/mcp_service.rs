@@ -1,6 +1,8 @@
 use my_ai_agent::{json_schema::*, my_json};
 use my_http_server::async_trait;
 
+use super::ToolCallContext;
+
 pub struct ToolCallOutput<T> {
     pub data: T,
     pub instruction: Option<String>,
@@ -72,10 +74,32 @@ where
 
 #[async_trait::async_trait]
 pub trait McpToolCallAbstract {
-    async fn execute(&self, input: &str) -> Result<ExecutedToolCall, String>;
+    /// `ctx` is built by the middleware for every tool call. Existing
+    /// `McpToolCall` impls ignore it; new `McpToolCallEx` impls use
+    /// it for elicitation and other server→client interactions.
+    async fn execute(
+        &self,
+        input: &str,
+        ctx: ToolCallContext,
+    ) -> Result<ExecutedToolCall, String>;
 
     fn get_fn_name(&self) -> &str;
     fn get_description(&self) -> &str;
     async fn get_input_params(&self) -> my_json::json_writer::JsonObjectWriter;
     async fn get_output_params(&self) -> my_json::json_writer::JsonObjectWriter;
+}
+
+/// Context-aware tool call. Implement this instead of [`McpToolCall`]
+/// when you need to reach back to the client (e.g. to elicit input).
+#[async_trait::async_trait]
+pub trait McpToolCallEx<InputData, OutputData>
+where
+    InputData: JsonTypeDescription + Sized + Send + Sync + 'static,
+    OutputData: JsonTypeDescription + Sized + Send + Sync + 'static,
+{
+    async fn execute_tool_call(
+        &self,
+        model: InputData,
+        ctx: &ToolCallContext,
+    ) -> Result<OutputData, String>;
 }
