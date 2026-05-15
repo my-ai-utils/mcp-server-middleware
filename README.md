@@ -455,6 +455,175 @@ These are two distinct mechanisms — do not confuse them:
 - **Server instructions** — the `instructions` argument of `McpMiddleware::new(path, name, version, instructions)`. They are returned once during `initialize` and apply to the entire session. Use them for global guidance ("this server exposes a Postgres database, queries should be read-only").
 - **Per-call instructions** — `ToolCallOutput::with_instruction(...)`. They are returned in the response to a specific `tools/call` and are scoped to that call's context. Use them for situational hints that depend on the actual tool result ("the search returned no rows — propose to widen the filter").
 
+## Server→client elicitation (asking the user for input)
+
+Sometimes a tool needs a value the model **must not** see — a database password, a 2FA code, an explicit confirmation for a destructive action. MCP calls this *elicitation*: mid-tool-call the server sends a JSON-RPC request back over the SSE stream asking the connected client to prompt the user. The user's answer is returned to the tool; only the tool's final result reaches the model.
+
+This is implemented as a **separate trait** — `McpToolCallEx` — and a **separate registration method** — `register_tool_call_with_context`. Plain `McpToolCall` impls are untouched.
+
+### Client-side prerequisite
+
+The connected MCP client must advertise the `elicitation` capability during `initialize`:
+
+```json
+{
+  "capabilities": {
+    "elicitation": {}
+  }
+}
+```
+
+If it did not, `ctx.elicit(...)` returns `Err("MCP client does not support elicitation")`. Many clients (and ad-hoc `curl`-style integrations) don't support elicitation — always handle the error path.
+
+### Implementing a context-aware tool
+
+Implement `McpToolCallEx` instead of `McpToolCall`. The execute method receives `&ToolCallContext` alongside the input:
+
+```rust
+use std::sync::Arc;
+use std::time::Duration;
+
+use mcp_server_middleware::{
+    ElicitationAction, McpToolCallEx, ToolCallContext, ToolDefinition,
+};
+use my_ai_agent::macros::ApplyJsonSchema;
+use serde::{Deserialize, Serialize};
+
+#[derive(ApplyJsonSchema, Debug, Serialize, Deserialize)]
+pub struct ConnectDbRequest {
+    #[property(description = "Database host, e.g. db.internal:5432")]
+    pub host: String,
+    #[property(description = "Database name")]
+    pub database: String,
+    #[property(description = "DB user")]
+    pub user: String,
+}
+
+#[derive(ApplyJsonSchema, Debug, Serialize, Deserialize)]
+pub struct ConnectDbResponse {
+    #[property(description = "Server version reported by the database")]
+    pub server_version: String,
+}
+
+pub struct ConnectDbHandler;
+
+impl ToolDefinition for ConnectDbHandler {
+    const FUNC_NAME: &'static str = "connect_db";
+    const DESCRIPTION: &'static str =
+        "Connect to a Postgres database. The password is asked from the user and never enters the model context.";
+}
+
+#[async_trait::async_trait]
+impl McpToolCallEx<ConnectDbRequest, ConnectDbResponse> for ConnectDbHandler {
+    async fn execute_tool_call(
+        &self,
+        req: ConnectDbRequest,
+        ctx: &ToolCallContext,
+    ) -> Result<ConnectDbResponse, String> {
+        // Flat JSON schema for what we want from the user.
+        // MCP elicitation only supports flat objects of primitive
+        // properties (string / number / integer / boolean / enum).
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "password": {
+                    "type": "string",
+                    "description": format!("Password for {}@{}", req.user, req.host),
+                    "format": "password",
+                },
+            },
+            "required": ["password"],
+        });
+
+        let resp = ctx
+            .elicit("Enter database password", schema, Duration::from_secs(60))
+            .await?;
+
+        match resp.action {
+            ElicitationAction::Accept => {
+                let password = resp
+                    .content
+                    .as_ref()
+                    .and_then(|c| c.get("password"))
+                    .and_then(|v| v.as_str())
+                    .ok_or("Elicitation accepted but `password` is missing")?
+                    .to_string();
+
+                let version = open_pg_connection(&req, &password).await?;
+                Ok(ConnectDbResponse { server_version: version })
+            }
+            ElicitationAction::Decline => {
+                Err("User declined to share the password".to_string())
+            }
+            ElicitationAction::Cancel => {
+                Err("Elicitation cancelled".to_string())
+            }
+        }
+    }
+}
+
+// Registration uses `register_tool_call_with_context` — NOT `register_tool_call`.
+mcp_middleware.register_tool_call_with_context(Arc::new(ConnectDbHandler));
+```
+
+### What `ToolCallContext` exposes
+
+```rust
+pub struct ToolCallContext {
+    pub session_id: String,         // mcp-session-id of the originating call
+    pub supports_elicitation: bool, // did the client advertise the capability?
+    // ...plus internal handles to the elicitation registry and the SSE sender
+}
+
+impl ToolCallContext {
+    pub async fn elicit(
+        &self,
+        message: &str,
+        requested_schema: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<ElicitationResponse, String>;
+}
+```
+
+What `elicit(...)` does under the hood:
+
+1. Allocates a **negative** request id (negative on purpose — never collides with ids the client allocates for its own requests).
+2. Pushes an `elicitation/create` JSON-RPC request onto the SSE stream for this session: `{ id, message, requestedSchema }`.
+3. Parks the call on a `oneshot` keyed by that id, with the supplied timeout.
+4. When the client POSTs back a response with the same `id`, the middleware parses it into an `ElicitationResponse` and wakes the parked call.
+
+The error path:
+- `"MCP client does not support elicitation"` — client didn't advertise `capabilities.elicitation` at `initialize`.
+- `"No active SSE channel for this MCP session"` — client opened a session but did not keep its `GET /mcp` SSE stream open.
+- `"Failed to deliver elicitation/create — SSE channel closed"` — the SSE stream died between allocation and send.
+- `"Elicitation timed out — client did not reply in time"` — timeout elapsed before the client responded.
+
+You can bubble these straight up with `?`, or remap them to a tool-specific message before returning.
+
+### The reply shape
+
+```rust
+pub enum ElicitationAction { Accept, Decline, Cancel }
+
+pub struct ElicitationResponse {
+    pub action: ElicitationAction,
+    /// Present when `action == Accept`. JSON object matching the
+    /// `requested_schema` you sent. `None` for Decline / Cancel.
+    pub content: Option<serde_json::Value>,
+}
+```
+
+Per the MCP spec:
+- `Accept` — user provided values. `content` is a JSON object matching the schema; pull fields out with `content.get("field_name")`.
+- `Decline` — user actively refused (e.g. clicked "Don't share"). Treat as a *refusal*, not an internal error — return a clean explanation to the model.
+- `Cancel` — user dismissed the prompt (closed the dialog, switched away). Usually treat the same as `Decline`; you can distinguish if your UX cares.
+
+If the client returns a malformed or error payload, the middleware coerces it into `Cancel` with `content == None` — so a `Cancel` branch covers both "user cancelled" and "client crashed."
+
+### Caveat: no inline instruction on the context-aware path
+
+`McpToolCallEx::execute_tool_call` returns `Result<OutputData, String>` directly — it does **not** go through `ToolCallOutput`. Context-aware tools therefore cannot attach an inline instruction via the `result.content[0].text` channel described in the "Returning instructions" section above. If you need both elicitation *and* an inline instruction, encode the hint inside `OutputData` itself, or split the work across two tools.
+
 ## Dynamic Enum Fields
 
 For tool call parameters that need to accept values from a dynamically generated list (such as filtering by available cities, countries, or other runtime-determined options), you can use dynamic enumeration. This feature allows enum values to be generated at runtime based on your application's current data state.
@@ -745,6 +914,14 @@ Registers a tool call service. The service must implement:
 * `ToolDefinition` trait
 * Input and output types must implement `JsonTypeDescription`, `Serialize`, and `DeserializeOwned`
 
+#### `register_tool_call_with_context(service)`
+
+Same as `register_tool_call`, but for tools that need to reach back to
+the client during execution (server→client elicitation, etc.). The
+service implements [`McpToolCallEx`] instead of `McpToolCall` and
+receives a `&ToolCallContext` argument in its execute method. See the
+"Server→client elicitation" section above for a worked example.
+
 #### `register_prompt(prompt)`
 
 Registers a prompt service. The service must implement:
@@ -796,6 +973,71 @@ where
     OutputData: JsonTypeDescription + Sized + Send + Sync + 'static,
 {
     async fn execute_tool_call(&self, model: InputData) -> Result<OutputData, String>;
+}
+```
+
+### `McpToolCallEx` Trait
+
+Context-aware variant of `McpToolCall`. Implement this when the tool
+needs to perform server→client interactions during execution
+(elicitation today; sampling/progress in the future). Register the
+service with `register_tool_call_with_context`.
+
+```rust
+#[async_trait::async_trait]
+pub trait McpToolCallEx<InputData, OutputData>
+where
+    InputData: JsonTypeDescription + Sized + Send + Sync + 'static,
+    OutputData: JsonTypeDescription + Sized + Send + Sync + 'static,
+{
+    async fn execute_tool_call(
+        &self,
+        model: InputData,
+        ctx: &ToolCallContext,
+    ) -> Result<OutputData, String>;
+}
+```
+
+Note: this trait returns `OutputData` directly — there is no
+`ToolCallOutput` wrapper, so inline instructions (the `content[0].text`
+channel) are not available on this path. See "Caveat: no inline
+instruction on the context-aware path" above.
+
+### `ToolCallContext`
+
+Built by the middleware per tool call and passed into
+`McpToolCallEx::execute_tool_call`. Exposes the session id, the
+client's `elicitation` capability flag, and the `elicit(...)` method
+documented in the "Server→client elicitation" section.
+
+```rust
+pub struct ToolCallContext {
+    pub session_id: String,
+    pub supports_elicitation: bool,
+    // ...internal handles
+}
+
+impl ToolCallContext {
+    pub async fn elicit(
+        &self,
+        message: &str,
+        requested_schema: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<ElicitationResponse, String>;
+}
+```
+
+### `ElicitationAction` / `ElicitationResponse`
+
+Returned by `ToolCallContext::elicit`. Per the MCP spec the client
+replies with one of three actions; `content` is `Some` only on `Accept`.
+
+```rust
+pub enum ElicitationAction { Accept, Decline, Cancel }
+
+pub struct ElicitationResponse {
+    pub action: ElicitationAction,
+    pub content: Option<serde_json::Value>,
 }
 ```
 
@@ -892,6 +1134,8 @@ The middleware fully implements the MCP protocol specification (2025-11-25) and 
 * **`ping`**: Health check endpoint for connection testing
 
 * **`notifications/initialized`**: Handles client initialization acknowledgment
+
+* **`elicitation/create`** *(server→client)*: Sent by the server to ask the connected client to prompt the user for input. Carries a message and a JSON schema describing the expected reply. Triggered from tool code via `ToolCallContext::elicit(...)`. Requires the client to advertise `capabilities.elicitation` at `initialize`. The client responds over the regular POST endpoint with the matching request id, and the middleware wakes the parked tool call. See the "Server→client elicitation" section for the full flow.
 
 ### Protocol Features
 
