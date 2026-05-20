@@ -613,7 +613,13 @@ impl HttpServerMiddleware for McpMiddleware {
                     ));
 
                     let now = DateTimeAsMicroseconds::now();
-                    return Some(stream.with_header("date", now.to_rfc7231()).get_result());
+                    return Some(
+                        stream
+                            .with_header("content-type", "text/event-stream")
+                            .with_header("cache-control", "no-cache")
+                            .with_header("date", now.to_rfc7231())
+                            .get_result(),
+                    );
                 }
 
                 return Some(
