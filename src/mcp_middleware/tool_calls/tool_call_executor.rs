@@ -4,8 +4,8 @@ use my_ai_agent::{json_schema::*, my_json};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::mcp_middleware::{
-    ExecutedToolCall, McpToolCallAbstract, McpToolCallEx, McpToolCallWithInstruction,
-    ToolCallContext,
+    ExecutedToolCall, McpToolCallAbstract, McpToolCallExWithInstruction,
+    McpToolCallWithInstruction, ToolCallContext,
 };
 use my_http_server::async_trait;
 
@@ -76,7 +76,8 @@ where
 {
     pub fn_name: &'static str,
     pub description: &'static str,
-    pub holder: Arc<dyn McpToolCallEx<InputData, OutputData> + Send + Sync + 'static>,
+    pub holder:
+        Arc<dyn McpToolCallExWithInstruction<InputData, OutputData> + Send + Sync + 'static>,
 }
 
 #[async_trait::async_trait]
@@ -108,8 +109,12 @@ where
     ) -> Result<ExecutedToolCall, String> {
         let parse_result: Result<InputData, serde_json::Error> = serde_json::from_str(input);
 
-        let data = match parse_result {
-            Ok(input) => self.holder.execute_tool_call(input, &ctx).await?,
+        let output = match parse_result {
+            Ok(input) => {
+                self.holder
+                    .execute_tool_call_with_instruction(input, &ctx)
+                    .await?
+            }
             Err(err) => {
                 let msg = format!("Can not deserialize input data {}. Msg: {:?}", input, err);
                 println!("{}", msg);
@@ -118,8 +123,8 @@ where
         };
 
         Ok(ExecutedToolCall {
-            structured_json: serde_json::to_string(&data).unwrap(),
-            instruction: None,
+            structured_json: serde_json::to_string(&output.data).unwrap(),
+            instruction: output.instruction,
         })
     }
 }

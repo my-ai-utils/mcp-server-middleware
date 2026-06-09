@@ -9,7 +9,7 @@ use my_http_server::HttpOutputProducer;
 /// socket has actually died (TCP keepalive is OS-level and slow). 15s is
 /// short enough to survive aggressive proxy idle timeouts and long enough
 /// not to add meaningful traffic.
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Initial `retry:` hint sent to EventSource-style clients so reconnect
 /// backoff has a sane default even if the client doesn't pick one.
@@ -21,6 +21,9 @@ pub enum McpSocketUpdateEvent {
     ToolsListChanged,
     ResourcesListChanged,
     PromptsListChanged,
+    /// `notifications/resources/updated` — sent to sessions that
+    /// subscribed to the URI via `resources/subscribe`.
+    ResourceUpdated { uri: String },
     /// Server→client request asking the client to elicit user input.
     /// Carries a server-allocated request id (negative, distinct from
     /// client-allocated ids), a prompt message and a pre-serialized
@@ -55,6 +58,17 @@ impl McpSocketUpdateEvent {
                 frame.push('\n');
                 return Some(frame.into_bytes());
             }
+            Self::ResourceUpdated { uri } => {
+                let mut frame = "data: ".to_string();
+                JsonObjectWriter::new()
+                    .write("jsonrpc", "2.0")
+                    .write("method", "notifications/resources/updated")
+                    .write_json_object("params", |p| p.write("uri", uri.as_str()))
+                    .build_into(&mut frame);
+                frame.push('\n');
+                frame.push('\n');
+                return Some(frame.into_bytes());
+            }
             _ => {}
         }
 
@@ -62,7 +76,9 @@ impl McpSocketUpdateEvent {
             Self::ToolsListChanged => "notifications/tools/list_changed",
             Self::ResourcesListChanged => "notifications/resources/list_changed",
             Self::PromptsListChanged => "notifications/prompts/list_changed",
-            Self::Shutdown | Self::ElicitationRequest { .. } => unreachable!(),
+            Self::Shutdown | Self::ElicitationRequest { .. } | Self::ResourceUpdated { .. } => {
+                unreachable!()
+            }
         };
 
         let mut frame = "data: ".to_string();

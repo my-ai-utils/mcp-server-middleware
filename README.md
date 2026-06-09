@@ -6,7 +6,7 @@ The middleware provides a flexible, trait-based architecture that allows you to 
 
 ## About Model Context Protocol (MCP)
 
-The Model Context Protocol (MCP) is a standardized protocol (specification version 2025-11-25) that enables AI applications to securely access external data sources and tools. MCP provides a unified interface for AI agents to interact with external systems, databases, APIs, and services.
+The Model Context Protocol (MCP) is a standardized protocol that enables AI applications to securely access external data sources and tools. MCP provides a unified interface for AI agents to interact with external systems, databases, APIs, and services. This middleware implements the Streamable HTTP transport and negotiates protocol revisions `2025-03-26`, `2025-06-18` and `2025-11-25` (an unknown requested version is answered with the latest supported one).
 
 ### Core Concepts
 
@@ -68,11 +68,12 @@ This middleware (`mcp-server-middleware`) is a **Rust library** that provides a 
 - Support for dynamic enum values based on runtime data
 
 **Protocol Compliance**:
-- Full implementation of MCP protocol specification (2025-11-25)
-- All required protocol methods (`initialize`, `tools/list`, `tools/call`, `prompts/list`, `prompts/get`, `resources/list`, `resources/read`, `ping`)
-- Proper JSON-RPC 2.0 formatting
-- SSE streaming support
-- Session management with secure session IDs
+- Streamable HTTP transport; protocol revisions `2025-03-26` / `2025-06-18` / `2025-11-25` with version negotiation at `initialize`
+- All required protocol methods (`initialize`, `tools/list`, `tools/call`, `prompts/list`, `prompts/get`, `resources/list`, `resources/read`, `resources/templates/list`, `resources/subscribe`, `resources/unsubscribe`, `ping`)
+- Notifications (`notifications/*`) accepted with `202`; unknown request methods answered with JSON-RPC `-32601`
+- Proper JSON-RPC 2.0 formatting, including string request ids and spec-shaped `error: {code, message}` objects
+- SSE streaming support with keepalives on both the GET notification stream and long `tools/call` responses
+- Session management with secure session IDs, `404` for expired sessions (clients auto-reinitialize) and background GC for abandoned sessions
 
 **Integration**:
 - Seamless integration with `my-http-server` as HTTP middleware
@@ -116,6 +117,13 @@ async-trait = "*"
 ```
 
 ## Quick Start
+
+A complete runnable example lives in [`examples/demo_server.rs`](examples/demo_server.rs) — one tool, one prompt, a static and a dynamic resource, plus a periodic `notify_resource_updated` trigger:
+
+```bash
+cargo run --example demo_server
+# then probe http://localhost:8081/mcp with curl or `npx @modelcontextprotocol/inspector`
+```
 
 ### 1. Create the Middleware
 
@@ -620,9 +628,25 @@ Per the MCP spec:
 
 If the client returns a malformed or error payload, the middleware coerces it into `Cancel` with `content == None` — so a `Cancel` branch covers both "user cancelled" and "client crashed."
 
-### Caveat: no inline instruction on the context-aware path
+### Inline instructions on the context-aware path
 
-`McpToolCallEx::execute_tool_call` returns `Result<OutputData, String>` directly — it does **not** go through `ToolCallOutput`. Context-aware tools therefore cannot attach an inline instruction via the `result.content[0].text` channel described in the "Returning instructions" section above. If you need both elicitation *and* an inline instruction, encode the hint inside `OutputData` itself, or split the work across two tools.
+To combine elicitation with an inline instruction, implement `McpToolCallExWithInstruction` instead of `McpToolCallEx` — same signature, but it returns `ToolCallOutput<OutputData>`, so `ToolCallOutput::with_instruction(...)` works exactly like on the plain path:
+
+```rust
+#[async_trait::async_trait]
+impl McpToolCallExWithInstruction<MyInput, MyOutput> for MyTool {
+    async fn execute_tool_call_with_instruction(
+        &self,
+        model: MyInput,
+        ctx: &ToolCallContext,
+    ) -> Result<ToolCallOutput<MyOutput>, String> {
+        // ... ctx.elicit(...) as usual ...
+        Ok(ToolCallOutput::with_instruction(output, "Hint for the model"))
+    }
+}
+```
+
+Every `McpToolCallEx` implementor gets `McpToolCallExWithInstruction` for free through a blanket impl (with `instruction = None`), so existing tools keep working unchanged. `register_tool_call_with_context` accepts both.
 
 ## Dynamic Enum Fields
 
@@ -961,6 +985,18 @@ Removes a dynamic resource. Returns `true` if a resource with that URI
 was present. Follow up with `notify_resources_changed()` so clients
 refresh their resource list.
 
+#### `notify_resource_updated(uri)` *(async)*
+
+Sends `notifications/resources/updated` for `uri` to every live session
+that subscribed to it via `resources/subscribe`. Call it whenever the
+content behind a resource changes.
+
+#### `with_session_idle_timeout(timeout)`
+
+Builder-style override for the session GC idle timeout (default 30
+minutes). Sessions without a live SSE stream that stay untouched longer
+than this are dropped by the background sweeper.
+
 ### `McpToolCall` Trait
 
 Trait that must be implemented by your tool services:
@@ -1093,14 +1129,15 @@ pub trait McpPromptService {
 
 ## MCP Protocol Support
 
-The middleware fully implements the MCP protocol specification (2025-11-25) and handles the following protocol methods:
+The middleware implements the MCP Streamable HTTP transport (protocol revisions `2025-03-26` / `2025-06-18` / `2025-11-25`, negotiated at `initialize`) and handles the following protocol methods:
 
 ### Core Protocol Methods
 
 * **`initialize`**: Initializes a new MCP session and returns server capabilities
-  - Declares support for tools, prompts, and resources
-  - Returns protocol version and server information
-  - Creates a new session with unique session ID
+  - Negotiates the protocol version (supported revisions echoed, unknown → latest supported)
+  - Declares `tools` / `prompts` capabilities when registered; the `resources` capability (with `subscribe` and `listChanged`) is advertised **always**, because dynamic resources may be registered at any moment after initialize
+  - Returns server information and creates a new session with a unique session ID
+  - Accepted with or without a stale session header — re-initialization always works
 
 * **`tools/list`**: Returns a list of available tools with their JSON schemas
   - Includes input and output schemas for each tool
@@ -1127,23 +1164,44 @@ The middleware fully implements the MCP protocol specification (2025-11-25) and 
   - Returns text or binary content based on resource type
   - Supports multiple content blocks per resource
 
-* **`resources/subscribe`**: Subscribes to resource changes
-  - Returns the initial version of the resource
-  - Currently returns the first version only (update notifications not yet implemented)
+* **`resources/templates/list`**: Returns an empty `resourceTemplates` list (URI templates are not supported, but clients that call this unconditionally get a valid response)
+
+* **`resources/subscribe`** / **`resources/unsubscribe`**: Per-session subscriptions to resource changes
+  - Subscribe validates the URI (unknown URI → `-32002 Resource not found`) and answers with an empty result, per spec
+  - Push updates to subscribers from your code via `McpMiddleware::notify_resource_updated(uri)` — subscribed sessions with a live SSE stream receive `notifications/resources/updated`
 
 * **`ping`**: Health check endpoint for connection testing
 
 * **`notifications/initialized`**: Handles client initialization acknowledgment
 
+* **Any other `notifications/*`** (e.g. `notifications/cancelled`): accepted with HTTP `202` and ignored, per the Streamable HTTP transport
+
+* **Unknown request methods**: answered with a standard JSON-RPC error `-32601 Method not found` instead of breaking the session
+
 * **`elicitation/create`** *(server→client)*: Sent by the server to ask the connected client to prompt the user for input. Carries a message and a JSON schema describing the expected reply. Triggered from tool code via `ToolCallContext::elicit(...)`. Requires the client to advertise `capabilities.elicitation` at `initialize`. The client responds over the regular POST endpoint with the matching request id, and the middleware wakes the parked tool call. See the "Server→client elicitation" section for the full flow.
 
 ### Protocol Features
 
-- **JSON-RPC 2.0**: All requests/responses follow JSON-RPC 2.0 format
+- **JSON-RPC 2.0**: All requests/responses follow JSON-RPC 2.0 format; request `id` may be a number **or a string** and is echoed back exactly as received
+- **Protocol version negotiation**: a supported `protocolVersion` is echoed; an unknown one is answered with the latest supported revision
 - **Server-Sent Events (SSE)**: Streaming responses for real-time updates
+- **Long tool calls survive proxies**: the `tools/call` response stream opens immediately and emits `: keepalive` SSE comments every 15s while the tool runs (essential for elicitation, where a human may think for minutes). If the client disconnects mid-call, the tool future is dropped (the call is cancelled)
 - **Session Management**: Secure session-based authentication via `mcp-session-id` header
 - **Type Safety**: Automatic JSON schema generation from Rust types
-- **Error Handling**: Standardized error codes and messages per MCP specification
+- **Error Handling**: Standardized JSON-RPC error objects (`error: {code, message}`) with MCP codes: `-32700` parse error, `-32601` method not found, `-32602` invalid params / unknown tool / unknown prompt, `-32002` resource not found, `-32603` internal error
+
+### HTTP status semantics
+
+| Situation | Status |
+|---|---|
+| Request/response handled | `200` (SSE stream) |
+| Notification or client JSON-RPC response accepted | `202` |
+| Missing `mcp-session-id` header (non-initialize) | `400` |
+| Unparsable JSON-RPC body | `400` + JSON-RPC `-32700` body |
+| Unknown / expired session (POST, GET, DELETE) | `404` — per spec the client re-initializes |
+| Session deleted via DELETE | `204` |
+
+`initialize` is accepted with or without a (possibly stale) session header and always mints a fresh session.
 
 ## Session Management
 
@@ -1153,6 +1211,8 @@ Sessions are automatically managed by the middleware:
 * Session IDs are returned in the `mcp-session-id` HTTP header
 * Subsequent requests must include the session ID in the `mcp-session-id` header
 * GET requests to the MCP path establish Server-Sent Events (SSE) streams for notifications
+* Sessions that have **no live SSE stream** and stay idle longer than the configured timeout are garbage-collected by a background sweeper (sweep interval 60s). The default idle timeout is 30 minutes; override it with `McpMiddleware::with_session_idle_timeout(Duration)`. Sessions with an open GET stream are never collected — a dead stream is detected within a couple of keepalive intervals and only then does the idle clock apply
+* `DELETE` with the session header terminates the session explicitly (`204`)
 
 ## Type Safety
 
@@ -1170,7 +1230,15 @@ The generated schemas are automatically used when clients call `tools/list` to d
 
 ## Error Handling
 
-Tool execution errors should be returned as `Err(String)` from `execute_tool_call`. The middleware will format these appropriately in the MCP response format, ensuring clients receive properly structured error information.
+Tool execution errors should be returned as `Err(String)` from `execute_tool_call`. The middleware reports them **in-band** per the MCP spec — the `tools/call` response carries `isError: true` with the message in `content[0].text` — so the model can see and react to the failure.
+
+Protocol-level problems are reported as JSON-RPC error objects instead:
+
+* unknown tool / unknown prompt → `-32602 Invalid params`
+* unknown resource URI on `resources/read` / `resources/subscribe` → `-32002 Resource not found`
+* unknown method → `-32601 Method not found`
+* unparsable request body → HTTP `400` with a `-32700 Parse error` body
+* resource read / prompt execution failure → `-32603 Internal error`
 
 ## Best Practices
 

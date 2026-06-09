@@ -19,3 +19,7 @@ parking_lot = "0.12"
 my-ai-agent = { tag = "0.1.0", git = "https://github.com/my-ai-utils/my-ai-agent.git", features = [
     "agent",
 ] }
+
+[dev-dependencies]
+# Collecting SSE bodies from HttpOutput::Raw responses in tests.
+http-body-util = "0.1"

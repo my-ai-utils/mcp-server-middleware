@@ -26,6 +26,13 @@ impl McpToolCalls {
         self.tool_calls.insert(name, executor);
     }
 
+    pub fn get(
+        &self,
+        fn_name: &str,
+    ) -> Option<Arc<dyn McpToolCallAbstract + Send + Sync + 'static>> {
+        self.tool_calls.get(fn_name).cloned()
+    }
+
     pub async fn execute(
         &self,
         fn_name: &str,

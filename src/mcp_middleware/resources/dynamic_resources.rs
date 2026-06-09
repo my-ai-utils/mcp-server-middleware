@@ -31,6 +31,10 @@ impl DynamicResources {
         !self.items.is_empty()
     }
 
+    pub fn contains(&self, uri: &str) -> bool {
+        self.items.contains_key(uri)
+    }
+
     pub async fn read(&self, uri: &str) -> Result<ResourceReadResult, String> {
         if let Some(executor) = self.items.get(uri) {
             return executor.holder.read_resource().await;

@@ -103,3 +103,104 @@ where
         ctx: &ToolCallContext,
     ) -> Result<OutputData, String>;
 }
+
+/// Context-aware counterpart of [`McpToolCallWithInstruction`]:
+/// implement it directly when a context-aware tool needs to attach an
+/// `instruction` to its output. Every [`McpToolCallEx`] gets it for
+/// free through the blanket impl below (instruction = None).
+#[async_trait::async_trait]
+pub trait McpToolCallExWithInstruction<InputData, OutputData>
+where
+    InputData: JsonTypeDescription + Sized + Send + Sync + 'static,
+    OutputData: JsonTypeDescription + Sized + Send + Sync + 'static,
+{
+    async fn execute_tool_call_with_instruction(
+        &self,
+        model: InputData,
+        ctx: &ToolCallContext,
+    ) -> Result<ToolCallOutput<OutputData>, String>;
+}
+
+#[async_trait::async_trait]
+impl<InputData, OutputData, T> McpToolCallExWithInstruction<InputData, OutputData> for T
+where
+    T: McpToolCallEx<InputData, OutputData> + Send + Sync + ?Sized,
+    InputData: JsonTypeDescription + Sized + Send + Sync + 'static,
+    OutputData: JsonTypeDescription + Sized + Send + Sync + 'static,
+{
+    async fn execute_tool_call_with_instruction(
+        &self,
+        model: InputData,
+        ctx: &ToolCallContext,
+    ) -> Result<ToolCallOutput<OutputData>, String> {
+        let data =
+            <T as McpToolCallEx<InputData, OutputData>>::execute_tool_call(self, model, ctx)
+                .await?;
+        Ok(ToolCallOutput::new(data))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::mcp_middleware::{McpElicitations, McpSessions, ToolCallContext};
+
+    struct PlainExTool;
+
+    #[async_trait::async_trait]
+    impl McpToolCallEx<String, String> for PlainExTool {
+        async fn execute_tool_call(
+            &self,
+            model: String,
+            _ctx: &ToolCallContext,
+        ) -> Result<String, String> {
+            Ok(format!("plain:{}", model))
+        }
+    }
+
+    struct InstructedExTool;
+
+    #[async_trait::async_trait]
+    impl McpToolCallExWithInstruction<String, String> for InstructedExTool {
+        async fn execute_tool_call_with_instruction(
+            &self,
+            model: String,
+            _ctx: &ToolCallContext,
+        ) -> Result<ToolCallOutput<String>, String> {
+            Ok(ToolCallOutput::with_instruction(model, "hint"))
+        }
+    }
+
+    fn test_ctx() -> ToolCallContext {
+        ToolCallContext {
+            session_id: "test".to_string(),
+            supports_elicitation: false,
+            elicitations: Arc::new(McpElicitations::new()),
+            sessions: Arc::new(McpSessions::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn blanket_impl_yields_no_instruction() {
+        let ctx = test_ctx();
+        let out = PlainExTool
+            .execute_tool_call_with_instruction("x".to_string(), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.data, "plain:x");
+        assert!(out.instruction.is_none());
+    }
+
+    #[tokio::test]
+    async fn direct_impl_carries_instruction() {
+        let ctx = test_ctx();
+        let out = InstructedExTool
+            .execute_tool_call_with_instruction("y".to_string(), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.data, "y");
+        assert_eq!(out.instruction.as_deref(), Some("hint"));
+    }
+}

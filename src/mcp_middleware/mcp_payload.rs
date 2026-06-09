@@ -1,14 +1,87 @@
 use std::collections::HashMap;
 
-use my_ai_agent::my_json::json_reader::JsonFirstLineIterator;
+use my_ai_agent::my_json::json_reader::{JsonFirstLineIterator, JsonValueRef};
+use my_ai_agent::my_json::json_writer::JsonValueWriter;
 use serde::{Deserialize, Serialize};
+
+/// JSON-RPC request id. Per the JSON-RPC 2.0 spec an id is a string, a
+/// number or null, and the response MUST echo it back exactly as
+/// received — hence the dedicated [`RequestId::Raw`] variant which
+/// preserves non-i64 numeric tokens (e.g. `1.5`) byte-identically.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RequestId {
+    Int(i64),
+    Str(String),
+    /// Numeric token that does not fit i64 (float, big int). Written
+    /// back verbatim, without quotes.
+    Raw(String),
+    Null,
+}
+
+impl RequestId {
+    pub fn parse(value: &JsonValueRef) -> Result<Self, String> {
+        if value.is_null() {
+            return Ok(Self::Null);
+        }
+
+        if value.is_string() {
+            let Some(value) = value.as_str() else {
+                return Err("Can not read request id as a string".to_string());
+            };
+            return Ok(Self::Str(value.to_string()));
+        }
+
+        let Some(raw) = value.as_raw_str() else {
+            return Err("Can not read request id".to_string());
+        };
+
+        if let Ok(int_value) = raw.parse::<i64>() {
+            return Ok(Self::Int(int_value));
+        }
+
+        Ok(Self::Raw(raw.to_string()))
+    }
+
+    pub fn is_null(&self) -> bool {
+        matches!(self, Self::Null)
+    }
+
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            Self::Int(value) => Some(*value),
+            _ => None,
+        }
+    }
+}
+
+impl JsonValueWriter for &RequestId {
+    const IS_ARRAY: bool = false;
+    fn write(&self, dest: &mut String) {
+        match self {
+            RequestId::Int(value) => dest.push_str(value.to_string().as_str()),
+            // Delegate to the &str writer so the value gets escaped.
+            RequestId::Str(value) => {
+                let as_str: &str = value.as_str();
+                JsonValueWriter::write(&as_str, dest);
+            }
+            RequestId::Raw(value) => dest.push_str(value.as_str()),
+            RequestId::Null => dest.push_str("null"),
+        }
+    }
+}
 #[derive(Debug)]
 pub enum McpInputData {
     Initialize(InitializeMpcContract),
     ResourcesList(ResourcesListModel),
+    ResourceTemplatesList,
     ReadResource(ReadResourceModel),
     SubscribeResource(SubscribeResourceModel),
+    UnsubscribeResource(UnsubscribeResourceModel),
     NotificationsInitialize,
+    /// Any other `notifications/*` method. Per the Streamable HTTP
+    /// transport notifications are accepted with `202` and ignored if
+    /// the server has no handler for them.
+    Notification { method: String },
     ToolsList,
     PromptsList,
     ExecuteToolCall(ExecuteToolCallModel),
@@ -34,6 +107,17 @@ impl McpInputData {
                 Ok(Self::Initialize(params))
             }
             "notifications/initialized" => Ok(Self::NotificationsInitialize),
+            "resources/templates/list" => Ok(Self::ResourceTemplatesList),
+            "resources/unsubscribe" => {
+                let model: UnsubscribeResourceModel =
+                    serde_json::from_str(&params).map_err(|err| {
+                        format!(
+                            "Can not deserialize unsubscribe resource data: {}. Err: {:?}",
+                            params, err
+                        )
+                    })?;
+                Ok(Self::UnsubscribeResource(model))
+            }
             "resources/list" => {
                 let model: Result<ResourcesListModel, serde_json::Error> =
                     serde_json::from_str(&params);
@@ -86,6 +170,9 @@ impl McpInputData {
                     })?;
                 Ok(Self::ExecuteToolCall(model))
             }
+            method if method.starts_with("notifications/") => Ok(Self::Notification {
+                method: method.to_string(),
+            }),
             _ => Ok(Self::Other {
                 method: method.to_string(),
                 data: params.to_string(),
@@ -97,7 +184,13 @@ impl McpInputData {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExecuteToolCallModel {
     pub name: String,
+    /// Optional per spec — tools with no input are called without it.
+    #[serde(default = "default_tool_call_arguments")]
     pub arguments: serde_json::Value,
+}
+
+fn default_tool_call_arguments() -> serde_json::Value {
+    serde_json::Value::Object(Default::default())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -121,10 +214,15 @@ pub struct SubscribeResourceModel {
     pub uri: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UnsubscribeResourceModel {
+    pub uri: String,
+}
+
 #[derive(Debug)]
 pub struct McpInputPayload {
     pub _version: String,
-    pub id: i64,
+    pub id: RequestId,
     pub data: McpInputData,
 }
 
@@ -134,7 +232,7 @@ impl McpInputPayload {
 
         let mut version: Option<String> = None;
         let mut method = None;
-        let mut id: Option<i64> = None;
+        let mut id = RequestId::Null;
         let mut params = None;
         let mut result_json: Option<String> = None;
         let mut error_json: Option<String> = None;
@@ -144,32 +242,24 @@ impl McpInputPayload {
 
             let name = name.as_str().map_err(|err| format!("{:?}", err))?;
 
-            let value = value.as_str();
-
             match name.as_str() {
                 "jsonrpc" => {
-                    version = value.map(|v| v.to_string());
+                    version = value.as_str().map(|v| v.to_string());
                 }
                 "method" => {
-                    method = value.map(|v| v.to_short_string());
+                    method = value.as_str().map(|v| v.to_short_string());
                 }
                 "id" => {
-                    if let Some(value) = value {
-                        let Ok(id_value) = value.as_str().parse() else {
-                            return Err(format!("Id is not number. {}", value.as_str()));
-                        };
-
-                        id = Some(id_value);
-                    }
+                    id = RequestId::parse(&value)?;
                 }
                 "params" => {
-                    params = value.map(|v| v.to_string());
+                    params = value.as_str().map(|v| v.to_string());
                 }
                 "result" => {
-                    result_json = value.map(|v| v.to_string());
+                    result_json = value.as_str().map(|v| v.to_string());
                 }
                 "error" => {
-                    error_json = value.map(|v| v.to_string());
+                    error_json = value.as_str().map(|v| v.to_string());
                 }
                 _ => {}
             }
@@ -182,10 +272,10 @@ impl McpInputPayload {
         // JSON-RPC response (no `method`, has `id` and `result`/`error`) →
         // routed to ServerResponse so the middleware can resolve the
         // matching pending server-initiated request (e.g. elicitation).
-        if method.is_none() && id.is_some() && (result_json.is_some() || error_json.is_some()) {
+        if method.is_none() && !id.is_null() && (result_json.is_some() || error_json.is_some()) {
             return Ok(Self {
                 _version: version.to_string(),
-                id: id.unwrap_or_default(),
+                id,
                 data: McpInputData::ServerResponse {
                     result_json,
                     error_json,
@@ -204,7 +294,7 @@ impl McpInputPayload {
 
         Ok(Self {
             _version: version.to_string(),
-            id: id.unwrap_or_default(),
+            id,
             data,
         })
     }
@@ -269,7 +359,7 @@ mod tests {
     fn parse_jsonrpc_response_routes_to_server_response() {
         let payload = r#"{"jsonrpc":"2.0","id":-1,"result":{"action":"accept","content":{"password":"x"}}}"#;
         let parsed = McpInputPayload::try_parse(payload.as_bytes()).unwrap();
-        assert_eq!(parsed.id, -1);
+        assert_eq!(parsed.id, RequestId::Int(-1));
         match parsed.data {
             McpInputData::ServerResponse { result_json, error_json } => {
                 assert!(error_json.is_none());
@@ -291,6 +381,64 @@ mod tests {
                 assert!(error_json.is_some());
             }
             other => panic!("expected ServerResponse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn string_request_id_is_preserved() {
+        let payload = r#"{"jsonrpc":"2.0","method":"tools/list","id":"req-abc"}"#;
+        let parsed = McpInputPayload::try_parse(payload.as_bytes()).unwrap();
+        assert_eq!(parsed.id, RequestId::Str("req-abc".to_string()));
+    }
+
+    #[test]
+    fn missing_request_id_is_null() {
+        let payload = r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}"#;
+        let parsed = McpInputPayload::try_parse(payload.as_bytes()).unwrap();
+        assert!(parsed.id.is_null());
+        match parsed.data {
+            McpInputData::Notification { method } => {
+                assert_eq!(method, "notifications/cancelled");
+            }
+            other => panic!("expected Notification, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn float_request_id_kept_raw() {
+        let payload = r#"{"jsonrpc":"2.0","method":"ping","id":1.5}"#;
+        let parsed = McpInputPayload::try_parse(payload.as_bytes()).unwrap();
+        assert_eq!(parsed.id, RequestId::Raw("1.5".to_string()));
+    }
+
+    #[test]
+    fn tool_call_without_arguments_defaults_to_empty_object() {
+        let payload = r#"{"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"echo"}}"#;
+        let parsed = McpInputPayload::try_parse(payload.as_bytes()).unwrap();
+        match parsed.data {
+            McpInputData::ExecuteToolCall(model) => {
+                assert_eq!(model.name, "echo");
+                assert!(model.arguments.is_object());
+                assert_eq!(model.arguments.as_object().unwrap().len(), 0);
+            }
+            other => panic!("expected ExecuteToolCall, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resource_templates_list_is_routed() {
+        let payload = r#"{"jsonrpc":"2.0","method":"resources/templates/list","id":3}"#;
+        let parsed = McpInputPayload::try_parse(payload.as_bytes()).unwrap();
+        assert!(matches!(parsed.data, McpInputData::ResourceTemplatesList));
+    }
+
+    #[test]
+    fn resource_unsubscribe_is_routed() {
+        let payload = r#"{"jsonrpc":"2.0","method":"resources/unsubscribe","id":4,"params":{"uri":"res://a"}}"#;
+        let parsed = McpInputPayload::try_parse(payload.as_bytes()).unwrap();
+        match parsed.data {
+            McpInputData::UnsubscribeResource(model) => assert_eq!(model.uri, "res://a"),
+            other => panic!("expected UnsubscribeResource, got {:?}", other),
         }
     }
 }

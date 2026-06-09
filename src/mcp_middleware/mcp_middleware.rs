@@ -1,21 +1,24 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use my_http_server::{hyper::Method, *};
 use rust_extensions::date_time::DateTimeAsMicroseconds;
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::mcp_middleware::{
-    DynamicResourceExecutor, DynamicResources, McpElicitations, McpInputPayload, McpPromptService,
-    McpPrompts, McpResourceService, McpResources, McpSessions, McpToolCallEx,
-    McpToolCallWithInstruction, McpToolCalls, PromptDefinition, PromptExecutor, ResourceDefinition,
-    ResourceExecutor, ResourceIcon, SESSION_HEADER, ToolCallContext, ToolCallExecutor,
-    ToolCallExecutorEx, parse_elicitation_response,
+    DynamicResourceExecutor, DynamicResources, InitializeMpcContract, McpElicitations,
+    McpInputData, McpInputPayload, McpPromptService, McpPrompts, McpResourceService, McpResources,
+    McpSessions, McpToolCallExWithInstruction, McpToolCallWithInstruction, McpToolCalls,
+    PromptDefinition, PromptExecutor, RequestId, ResourceDefinition, ResourceExecutor,
+    ResourceIcon, SESSION_HEADER, ToolCallContext, ToolCallExecutor, ToolCallExecutorEx,
+    parse_elicitation_response,
 };
 
 use my_ai_agent::{ToolDefinition, json_schema::*};
 
 pub struct McpMiddleware {
-    mpc_path: &'static str,
+    mcp_path: &'static str,
     name: &'static str,
     version: &'static str,
     instructions: &'static str,
@@ -31,17 +34,25 @@ pub struct McpMiddleware {
     /// requests. Tools opted into [`McpToolCallEx`] reach this through
     /// the [`ToolCallContext`] supplied at execute-time.
     elicitations: Arc<McpElicitations>,
+    /// Sessions idle longer than this (and without a live SSE channel)
+    /// are garbage-collected. See [`Self::with_session_idle_timeout`].
+    session_idle_timeout: Duration,
+    /// The GC task is started lazily on the first request, which is
+    /// guaranteed to run inside the tokio runtime (unlike `new()`).
+    gc_started: AtomicBool,
 }
+
+const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 impl McpMiddleware {
     pub fn new(
-        mpc_path: &'static str,
+        mcp_path: &'static str,
         name: &'static str,
         version: &'static str,
         instructions: &'static str,
     ) -> Self {
         Self {
-            mpc_path,
+            mcp_path,
             name,
             version,
             instructions,
@@ -51,7 +62,23 @@ impl McpMiddleware {
             resources: McpResources::new(),
             dynamic_resources: Arc::new(tokio::sync::RwLock::new(DynamicResources::new())),
             elicitations: Arc::new(McpElicitations::new()),
+            session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
+            gc_started: AtomicBool::new(false),
         }
+    }
+
+    /// Overrides how long a session may stay idle (no requests, no live
+    /// SSE stream) before the background GC drops it. Default: 30 min.
+    pub fn with_session_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.session_idle_timeout = timeout;
+        self
+    }
+
+    /// Pushes `notifications/resources/updated` for `uri` to every live
+    /// session that subscribed to it via `resources/subscribe`. Call it
+    /// whenever the content behind a resource changes.
+    pub async fn notify_resource_updated(&self, uri: &str) {
+        self.sessions.notify_resource_updated(uri).await;
     }
 
     pub async fn notify_tools_changed(&self) {
@@ -95,11 +122,17 @@ impl McpMiddleware {
 
     /// Same as [`Self::register_tool_call`] but for tools that need
     /// access to a [`ToolCallContext`] (server→client elicitation,
-    /// session metadata, etc.). The tool implements [`McpToolCallEx`].
+    /// session metadata, etc.). The tool implements [`McpToolCallEx`]
+    /// or, when it wants to attach an `instruction` to the output,
+    /// [`McpToolCallExWithInstruction`] directly.
     pub fn register_tool_call_with_context<
         InputData: JsonTypeDescription + Sized + Send + Sync + 'static + Serialize + DeserializeOwned,
         OutputData: JsonTypeDescription + Sized + Send + Sync + 'static + Serialize + DeserializeOwned,
-        TMcpService: McpToolCallEx<InputData, OutputData> + Send + Sync + 'static + ToolDefinition,
+        TMcpService: McpToolCallExWithInstruction<InputData, OutputData>
+            + Send
+            + Sync
+            + 'static
+            + ToolDefinition,
     >(
         &mut self,
         service: Arc<TMcpService>,
@@ -211,39 +244,48 @@ impl McpMiddleware {
         w.remove(uri)
     }
 
+    /// Shared by both the with-session and the without-session POST
+    /// paths: `initialize` always mints a fresh session, even when the
+    /// client sends a stale `mcp-session-id` header.
+    async fn handle_initialize(
+        &self,
+        contract: InitializeMpcContract,
+        now: DateTimeAsMicroseconds,
+        id: &RequestId,
+    ) -> Result<HttpOkResult, HttpFailResult> {
+        let protocol_version = super::mcp_output_contract::negotiate_protocol_version(
+            contract.protocol_version.as_str(),
+        )
+        .to_string();
+
+        let response = super::mcp_output_contract::compile_init_response(
+            &self.name,
+            &self.version,
+            &self.instructions,
+            protocol_version.as_str(),
+            id,
+            self.tool_calls.has_tools(),
+            self.prompts.has_prompts(),
+        );
+
+        let supports_elicitation = contract.capabilities.elicitation.is_some();
+        let session_id = self
+            .sessions
+            .generate_session(protocol_version, now, supports_elicitation);
+
+        send_response_as_stream(response, session_id.as_str(), now)
+    }
+
     async fn handle_authorized_request(
         &self,
         session_id: &str,
-        payload: McpInputPayload,
+        data: McpInputData,
         now: DateTimeAsMicroseconds,
-        id: i64,
+        id: &RequestId,
     ) -> Result<HttpOkResult, HttpFailResult> {
-        match payload.data {
+        match data {
             super::McpInputData::Initialize(contract) => {
-                //println!("Initializing {:?}", contract);
-
-                let has_resources = self.resources.has_resources()
-                    || self.dynamic_resources.read().await.has_resources();
-
-                let response = super::mcp_output_contract::compile_init_response(
-                    &self.name,
-                    &self.version,
-                    &self.instructions,
-                    &contract.protocol_version,
-                    id,
-                    self.tool_calls.has_tools(),
-                    has_resources,
-                    self.prompts.has_prompts(),
-                );
-
-                let supports_elicitation = contract.capabilities.elicitation.is_some();
-                let session_id = self.sessions.generate_session(
-                    contract.protocol_version,
-                    now,
-                    supports_elicitation,
-                );
-
-                return send_response_as_stream(response, session_id.as_str(), now);
+                return self.handle_initialize(contract, now, id).await;
             }
 
             super::McpInputData::ResourcesList(params) => {
@@ -268,15 +310,28 @@ impl McpMiddleware {
                 return send_response_as_stream(response, session_id, now);
             }
 
-            super::McpInputData::ReadResource(params) => {
-                //println!("Reading resource with URI: {:?}", params.uri);
+            super::McpInputData::ResourceTemplatesList => {
+                // No URI-template support — an empty list keeps clients
+                // that call this unconditionally (Inspector, Claude) happy.
+                let response = super::mcp_output_contract::compile_resource_templates_list(id);
+                return send_response_as_stream(response, session_id, now);
+            }
 
-                let read_result = match self.resources.read(&params.uri).await {
-                    Ok(r) => Ok(r),
-                    Err(_) => {
-                        let guard = self.dynamic_resources.read().await;
-                        guard.read(&params.uri).await
+            super::McpInputData::ReadResource(params) => {
+                let read_result = if self.resources.get(&params.uri).is_some() {
+                    self.resources.read(&params.uri).await
+                } else {
+                    let guard = self.dynamic_resources.read().await;
+                    if !guard.contains(&params.uri) {
+                        return send_jsonrpc_error_as_stream(
+                            super::mcp_output_contract::JSONRPC_RESOURCE_NOT_FOUND,
+                            format!("Resource not found: {}", params.uri).as_str(),
+                            id,
+                            session_id,
+                            now,
+                        );
                     }
+                    guard.read(&params.uri).await
                 };
 
                 match read_result {
@@ -287,55 +342,74 @@ impl McpMiddleware {
                         return send_response_as_stream(response, session_id, now);
                     }
                     Err(err) => {
-                        eprintln!(
-                            "Error reading resource {} with URI {}. Err: {}",
-                            params.uri, params.uri, err
-                        );
+                        eprintln!("Error reading resource with URI {}. Err: {}", params.uri, err);
 
-                        return send_error_response_as_stream(err, session_id, id, now);
+                        return send_jsonrpc_error_as_stream(
+                            super::mcp_output_contract::JSONRPC_INTERNAL_ERROR,
+                            err.as_str(),
+                            id,
+                            session_id,
+                            now,
+                        );
                     }
                 }
             }
 
             super::McpInputData::SubscribeResource(params) => {
-              //  println!("Subscribing to resource with URI: {:?}", params.uri);
+                let known = self.resources.get(&params.uri).is_some()
+                    || self.dynamic_resources.read().await.contains(&params.uri);
 
-                let read_result = match self.resources.read(&params.uri).await {
-                    Ok(r) => Ok(r),
-                    Err(_) => {
-                        let guard = self.dynamic_resources.read().await;
-                        guard.read(&params.uri).await
-                    }
-                };
-
-                match read_result {
-                    Ok(response) => {
-                        // Return the initial version of the resource
-                        // Note: We're not implementing updates, just returning the first version
-                        let response = super::mcp_output_contract::compile_read_resource_response(
-                            response, id,
-                        );
-                        return send_response_as_stream(response, session_id, now);
-                    }
-                    Err(err) => {
-                        eprintln!(
-                            "Error subscribing to resource {} with URI {}. Err: {}",
-                            params.uri, params.uri, err
-                        );
-
-                        return send_error_response_as_stream(err, session_id, id, now);
-                    }
+                if !known {
+                    return send_jsonrpc_error_as_stream(
+                        super::mcp_output_contract::JSONRPC_RESOURCE_NOT_FOUND,
+                        format!("Resource not found: {}", params.uri).as_str(),
+                        id,
+                        session_id,
+                        now,
+                    );
                 }
+
+                self.sessions.subscribe(session_id, params.uri);
+
+                // Per spec the subscribe response carries an empty result;
+                // updates arrive later as `notifications/resources/updated`.
+                let response = super::mcp_output_contract::compile_empty_result_response(id);
+                return send_response_as_stream(response, session_id, now);
+            }
+
+            super::McpInputData::UnsubscribeResource(params) => {
+                // Idempotent: unsubscribing from an unknown URI is a no-op.
+                self.sessions.unsubscribe(session_id, &params.uri);
+
+                let response = super::mcp_output_contract::compile_empty_result_response(id);
+                return send_response_as_stream(response, session_id, now);
             }
 
             super::McpInputData::Ping => {
-                let response = super::mcp_output_contract::build_ping_response(id);
+                let response = super::mcp_output_contract::compile_empty_result_response(id);
                 return send_response_as_stream(response, session_id, now);
             }
 
             super::McpInputData::ExecuteToolCall(params) => {
-                let arguments = serde_json::to_string(&params.arguments)
-                    .unwrap_or_else(|_| "{}".to_string());
+                // Unknown tool is a protocol-level error per spec, unlike
+                // runtime failures which are reported in-band (isError).
+                let Some(tool_call) = self.tool_calls.get(&params.name) else {
+                    return send_jsonrpc_error_as_stream(
+                        super::mcp_output_contract::JSONRPC_INVALID_PARAMS,
+                        format!("Unknown tool: {}", params.name).as_str(),
+                        id,
+                        session_id,
+                        now,
+                    );
+                };
+
+                // serde(default) covers a missing `arguments` key; an
+                // explicit `"arguments": null` still needs this guard.
+                let arguments = if params.arguments.is_null() {
+                    "{}".to_string()
+                } else {
+                    serde_json::to_string(&params.arguments).unwrap_or_else(|_| "{}".to_string())
+                };
 
                 let ctx = ToolCallContext {
                     session_id: session_id.to_string(),
@@ -346,34 +420,67 @@ impl McpMiddleware {
                     sessions: self.sessions.clone(),
                 };
 
-                match self
-                    .tool_calls
-                    .execute(&params.name, &arguments, ctx)
-                    .await
-                {
-                    Ok(executed) => {
-                        let response =
-                            super::mcp_output_contract::compile_execute_tool_call_response(
-                                executed.structured_json,
-                                executed.instruction,
-                                id,
-                                false,
-                            );
-                        return send_response_as_stream(response, session_id, now);
-                    }
-                    Err(err) => {
-                        eprintln!(
-                            "Error executing {} with params {}. Err: {}",
-                            params.name, arguments, err
-                        );
-                        let response =
-                            super::mcp_output_contract::compile_execute_tool_call_response(
-                                err, None, id, true,
-                            );
+                // The SSE response stream opens immediately and emits
+                // keepalive comments while the tool runs, so proxies do
+                // not cut long calls (elicitation can wait on a human
+                // for minutes). If the client disconnects mid-call the
+                // keepalive send fails and the tool future is dropped,
+                // i.e. the call is cancelled — half-done side effects
+                // are the tool's responsibility.
+                let (http_output, mut producer) = HttpOutput::as_stream(32);
 
-                        return send_response_as_stream(response, session_id, now);
+                let id = id.clone();
+                let tool_name = params.name;
+
+                tokio::spawn(async move {
+                    let execute = tool_call.execute(arguments.as_str(), ctx);
+                    tokio::pin!(execute);
+
+                    let mut keepalive = tokio::time::interval(super::KEEPALIVE_INTERVAL);
+                    // interval()'s first tick fires immediately — skip it.
+                    keepalive.tick().await;
+
+                    loop {
+                        tokio::select! {
+                            result = &mut execute => {
+                                let response = match result {
+                                    Ok(executed) => {
+                                        super::mcp_output_contract::compile_execute_tool_call_response(
+                                            executed.structured_json,
+                                            executed.instruction,
+                                            &id,
+                                            false,
+                                        )
+                                    }
+                                    Err(err) => {
+                                        eprintln!(
+                                            "Error executing {} with params {}. Err: {}",
+                                            tool_name, arguments, err
+                                        );
+                                        super::mcp_output_contract::compile_execute_tool_call_response(
+                                            err, None, &id, true,
+                                        )
+                                    }
+                                };
+
+                                let _ = producer.send(response.into_bytes()).await;
+                                return;
+                            }
+                            _ = keepalive.tick() => {
+                                if producer.send(b": keepalive\n\n".to_vec()).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
                     }
-                }
+                });
+
+                return http_output
+                    .with_header(SESSION_HEADER, session_id)
+                    .with_header("cache-control", "no-cache")
+                    .with_header("content-type", "text/event-stream")
+                    .with_header("date", now.to_rfc7231())
+                    .get_result();
             }
 
             super::McpInputData::ToolsList => {
@@ -391,14 +498,23 @@ impl McpMiddleware {
             }
 
             super::McpInputData::GetPrompt(params) => {
-                //println!("Getting prompts with params: {:?}", params);
-
                 let arguments = match params.arguments {
                     Some(args) => args,
                     None => Default::default(),
                 };
 
-                match self.prompts.execute(&params.name, &arguments).await {
+                // Unknown prompt name → protocol-level Invalid params.
+                let Some(prompt) = self.prompts.get(&params.name) else {
+                    return send_jsonrpc_error_as_stream(
+                        super::mcp_output_contract::JSONRPC_INVALID_PARAMS,
+                        format!("Unknown prompt: {}", params.name).as_str(),
+                        id,
+                        session_id,
+                        now,
+                    );
+                };
+
+                match prompt.execute(&arguments).await {
                     Ok(response) => {
                         let response =
                             super::mcp_output_contract::compile_get_prompt_response(response, id);
@@ -410,18 +526,29 @@ impl McpMiddleware {
                             params.name, arguments, err
                         );
 
-                        return send_error_response_as_stream(err, session_id, id, now);
+                        return send_jsonrpc_error_as_stream(
+                            super::mcp_output_contract::JSONRPC_INTERNAL_ERROR,
+                            err.as_str(),
+                            id,
+                            session_id,
+                            now,
+                        );
                     }
                 }
             }
 
             super::McpInputData::NotificationsInitialize => {
-                //println!("Sending notifications Initialize");
-                return HttpOutput::from_builder()
-                    .add_header("date", now.to_rfc7231())
-                    .set_status_code(202)
-                    .into_ok_result(false);
+                return accepted_response(now);
             }
+
+            super::McpInputData::Notification { method: _ } => {
+                // Per the Streamable HTTP transport every accepted
+                // notification gets 202; ones we have no handler for
+                // (notifications/cancelled, roots/list_changed, ...)
+                // are simply ignored.
+                return accepted_response(now);
+            }
+
             super::McpInputData::ServerResponse {
                 result_json,
                 error_json,
@@ -430,19 +557,28 @@ impl McpMiddleware {
                     result_json.as_deref(),
                     error_json.as_deref(),
                 );
-                self.elicitations.resolve(id, response);
-                return HttpOutput::from_builder()
-                    .add_header("date", now.to_rfc7231())
-                    .set_status_code(202)
-                    .into_ok_result(false);
+                if let Some(request_id) = id.as_int() {
+                    self.elicitations.resolve(request_id, response);
+                }
+                return accepted_response(now);
             }
+
             super::McpInputData::Other { method, data } => {
-                println!("Unsupported method: {}. Data: `{}`", method, data);
-                return HttpOutput::as_fatal_error(format!(
-                    "Unsupported method: {}. data: {}",
-                    method, data
-                ))
-                .into_err(false, false);
+                eprintln!("Unsupported MCP method: {}. Data: `{}`", method, data);
+
+                // Requests (id present) get a JSON-RPC error; id-less
+                // inputs are notifications by definition → 202.
+                if id.is_null() {
+                    return accepted_response(now);
+                }
+
+                return send_jsonrpc_error_as_stream(
+                    super::mcp_output_contract::JSONRPC_METHOD_NOT_FOUND,
+                    format!("Method not found: {}", method).as_str(),
+                    id,
+                    session_id,
+                    now,
+                );
             }
         }
     }
@@ -452,96 +588,72 @@ impl McpMiddleware {
         session_id: Option<&str>,
         body: &[u8],
     ) -> Result<HttpOkResult, HttpFailResult> {
-        //println!("Parsing: {}", String::from_utf8_lossy(body));
+        let now = DateTimeAsMicroseconds::now();
 
         let payload = match super::McpInputPayload::try_parse(body) {
             Ok(payload) => payload,
             Err(err) => {
-                return HttpOutput::as_fatal_error(format!(
-                    "Can not execute http request. Err: {}",
-                    err
-                ))
-                .into_err(false, false);
+                // Malformed JSON-RPC → HTTP 400 with a standard Parse
+                // error body (no SSE framing on plain HTTP errors).
+                let body = super::mcp_output_contract::compile_jsonrpc_error_body(
+                    super::mcp_output_contract::JSONRPC_PARSE_ERROR,
+                    format!("Parse error: {}", err).as_str(),
+                    &RequestId::Null,
+                );
+                return HttpOutput::from_builder()
+                    .set_content(body.into_bytes())
+                    .set_content_type(WebContentType::Json)
+                    .set_status_code(400)
+                    .add_header("date", now.to_rfc7231())
+                    .into_ok_result(false);
             }
         };
 
-        let id = payload.id;
+        let McpInputPayload { id, data, .. } = payload;
 
-        let now = DateTimeAsMicroseconds::now();
-
-        if let Some(session_id) = session_id {
-            if !self
-                .sessions
-                .check_session_and_update_last_used(session_id, now)
-            {
-                return HttpOutput::as_unauthorized(None).into_err(false, false);
-            }
-
-            return self
-                .handle_authorized_request(session_id, payload, now, id)
-                .await;
+        // `initialize` is valid both with and without a session header —
+        // a stale header must not block a client from re-initializing.
+        if let super::McpInputData::Initialize(contract) = data {
+            return self.handle_initialize(contract, now, &id).await;
         }
 
-        match payload.data {
-            super::McpInputData::Initialize(contract) => {
-                //println!("Initializing {:?}", contract);
+        let Some(session_id) = session_id else {
+            // Spec: every non-initialize request must carry the session
+            // header once the server has issued one.
+            return Err(HttpFailResult::as_validation_error(
+                "Missing mcp-session-id header",
+            ));
+        };
 
-                let has_resources = self.resources.has_resources()
-                    || self.dynamic_resources.read().await.has_resources();
-
-                let response = super::mcp_output_contract::compile_init_response(
-                    &self.name,
-                    &self.version,
-                    &self.instructions,
-                    &contract.protocol_version,
-                    id,
-                    self.tool_calls.has_tools(),
-                    has_resources,
-                    self.prompts.has_prompts(),
-                );
-
-                let supports_elicitation = contract.capabilities.elicitation.is_some();
-                let session_id = self.sessions.generate_session(
-                    contract.protocol_version,
-                    now,
-                    supports_elicitation,
-                );
-
-                send_response_as_stream(response, session_id.as_str(), now)
-            }
-            super::McpInputData::Other { method, data } => {
-                eprintln!("Unsupported method: {}. Data: `{}`", method, data);
-                return HttpOutput::as_fatal_error(format!(
-                    "Unsupported method: {}. data: {}",
-                    method, data
-                ))
-                .into_err(false, false);
-            }
-
-            _ => HttpOutput::as_unauthorized(None).into_err(false, false),
+        if !self
+            .sessions
+            .check_session_and_update_last_used(session_id, now)
+        {
+            // Spec: 404 signals the session is gone and the client
+            // should start over with a new `initialize`.
+            return Err(HttpFailResult::as_not_found("Unknown MCP session", false));
         }
+
+        self.handle_authorized_request(session_id, data, now, &id)
+            .await
     }
 }
 
-fn send_error_response_as_stream(
-    error_mgs: String,
+fn accepted_response(now: DateTimeAsMicroseconds) -> Result<HttpOkResult, HttpFailResult> {
+    HttpOutput::from_builder()
+        .add_header("date", now.to_rfc7231())
+        .set_status_code(202)
+        .into_ok_result(false)
+}
+
+fn send_jsonrpc_error_as_stream(
+    code: i64,
+    message: &str,
+    id: &RequestId,
     session_id: &str,
-    id: i64,
     now: DateTimeAsMicroseconds,
 ) -> Result<HttpOkResult, HttpFailResult> {
-    let mut response = my_ai_agent::my_json::json_writer::JsonObjectWriter::new()
-        .write("jsonrpc", "2.0")
-        .write("id", id)
-        .write("type", "error")
-        .write("code", 500)
-        .write("details", error_mgs)
-        .build();
-
-    response.insert_str(0, "data: ");
-    response.push('\n');
-    response.push('\n');
-
-    println!("Response: {:?}", response);
+    let response = super::mcp_output_contract::compile_jsonrpc_error(code, message, id);
     send_response_as_stream(response, session_id, now)
 }
 
@@ -552,9 +664,9 @@ fn send_response_as_stream(
 ) -> Result<HttpOkResult, HttpFailResult> {
     let (http_output, mut producer) = HttpOutput::as_stream(1024);
     tokio::spawn(async move {
-      //  println!("Sending response: `{}`", response);
         let payload = response.into_bytes();
-        producer.send(payload).await.unwrap();
+        // Client may disconnect before reading the response — nothing to do.
+        let _ = producer.send(payload).await;
     });
 
     http_output
@@ -574,35 +686,37 @@ impl HttpServerMiddleware for McpMiddleware {
         if !ctx
             .request
             .get_path()
-            .equals_to_case_insensitive(self.mpc_path)
+            .equals_to_case_insensitive(self.mcp_path)
         {
             return None;
         }
 
-        /*
-        println!(
-            "Mpc Middleware {:?} {}",
-            ctx.request.method,
-            ctx.request.get_path().as_str()
-        );
-        */
+        // Lazy GC start: handle_request always runs inside the tokio
+        // runtime, which `new()` can not guarantee.
+        if !self.gc_started.swap(true, Ordering::Relaxed) {
+            super::spawn_session_gc(Arc::downgrade(&self.sessions), self.session_idle_timeout);
+        }
+
         let session_id = ctx
             .request
             .get_headers()
             .try_get_case_sensitive(SESSION_HEADER)
-            .map(|itm| itm.as_str().unwrap().to_string());
+            .and_then(|itm| itm.as_str().ok().map(|s| s.to_string()));
 
         match ctx.request.method {
             Method::GET => {
                 let Some(session_id) = session_id else {
                     return Some(
-                        HttpFailResult::as_unauthorized(Some("Unauthorized request")).into_err(),
+                        HttpFailResult::as_validation_error("Missing mcp-session-id header")
+                            .into_err(),
                     );
                 };
 
+                let now = DateTimeAsMicroseconds::now();
+
                 if let Some(receiver) = self
                     .sessions
-                    .subscribe_to_notifications(session_id.as_str())
+                    .subscribe_to_notifications(session_id.as_str(), now)
                 {
                     let (stream, producer) = HttpOutput::as_stream(32);
                     tokio::spawn(super::stream_updates(
@@ -612,7 +726,6 @@ impl HttpServerMiddleware for McpMiddleware {
                         session_id.clone(),
                     ));
 
-                    let now = DateTimeAsMicroseconds::now();
                     return Some(
                         stream
                             .with_header("content-type", "text/event-stream")
@@ -623,7 +736,7 @@ impl HttpServerMiddleware for McpMiddleware {
                 }
 
                 return Some(
-                    HttpFailResult::as_unauthorized(Some("Unauthorized request")).into_err(),
+                    HttpFailResult::as_not_found("Unknown MCP session", false).into_err(),
                 );
             }
             Method::POST => {
@@ -642,7 +755,8 @@ impl HttpServerMiddleware for McpMiddleware {
             Method::DELETE => {
                 let Some(session_id) = session_id else {
                     return Some(
-                        HttpFailResult::as_unauthorized(Some("Unauthorized request")).into_err(),
+                        HttpFailResult::as_validation_error("Missing mcp-session-id header")
+                            .into_err(),
                     );
                 };
 
@@ -650,7 +764,7 @@ impl HttpServerMiddleware for McpMiddleware {
 
                 if !removed {
                     return Some(
-                        HttpFailResult::as_unauthorized(Some("Unknown session")).into_err(),
+                        HttpFailResult::as_not_found("Unknown MCP session", false).into_err(),
                     );
                 }
 
@@ -666,5 +780,276 @@ impl HttpServerMiddleware for McpMiddleware {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ToolDefinition;
+    use crate::mcp_middleware::McpToolCall;
+    use my_ai_agent::json_schema::JsonTypeDescription;
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct EchoInput {
+        #[serde(default)]
+        text: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl JsonTypeDescription for EchoInput {
+        async fn get_description(
+            _has_default: bool,
+            _with_enum: Option<Vec<rust_extensions::StrOrString<'static>>>,
+            _output: bool,
+        ) -> my_ai_agent::my_json::json_writer::JsonObjectWriter {
+            my_ai_agent::my_json::json_writer::JsonObjectWriter::new().write("type", "object")
+        }
+    }
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    struct EchoOutput {
+        echoed: String,
+    }
+
+    #[async_trait::async_trait]
+    impl JsonTypeDescription for EchoOutput {
+        async fn get_description(
+            _has_default: bool,
+            _with_enum: Option<Vec<rust_extensions::StrOrString<'static>>>,
+            _output: bool,
+        ) -> my_ai_agent::my_json::json_writer::JsonObjectWriter {
+            my_ai_agent::my_json::json_writer::JsonObjectWriter::new().write("type", "object")
+        }
+    }
+
+    struct EchoTool;
+
+    impl ToolDefinition for EchoTool {
+        const FUNC_NAME: &'static str = "echo";
+        const DESCRIPTION: &'static str = "Echoes the input back";
+    }
+
+    #[async_trait::async_trait]
+    impl McpToolCall<EchoInput, EchoOutput> for EchoTool {
+        async fn execute_tool_call(&self, model: EchoInput) -> Result<EchoOutput, String> {
+            Ok(EchoOutput {
+                echoed: model.text.unwrap_or_default(),
+            })
+        }
+    }
+
+    fn middleware_with_echo_tool() -> McpMiddleware {
+        let mut mcp = McpMiddleware::new("/mcp", "test-server", "0.0.1", "test instructions");
+        mcp.register_tool_call(Arc::new(EchoTool));
+        mcp
+    }
+
+    /// Drains an SSE (`HttpOutput::Raw`) response: returns
+    /// (status, body, mcp-session-id header).
+    async fn read_sse_response(
+        result: Result<HttpOkResult, HttpFailResult>,
+    ) -> (u16, String, Option<String>) {
+        let ok = result.expect("expected Ok result");
+        match ok.output {
+            HttpOutput::Raw(response) => {
+                let status = response.status().as_u16();
+                let session_id = response
+                    .headers()
+                    .get(SESSION_HEADER)
+                    .map(|v| v.to_str().unwrap().to_string());
+                let collected = http_body_util::BodyExt::collect(response.into_body())
+                    .await
+                    .expect("body collected");
+                let body = String::from_utf8(collected.to_bytes().to_vec()).unwrap();
+                (status, body, session_id)
+            }
+            other => panic!("expected Raw stream output, got {:?}", other),
+        }
+    }
+
+    async fn initialize_session(mcp: &McpMiddleware) -> String {
+        let body = br#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-06-18","capabilities":{}}}"#;
+        let result = mcp.handle_post_request(None, body).await;
+        let (status, _, session_id) = read_sse_response(result).await;
+        assert_eq!(status, 200);
+        session_id.expect("initialize must return mcp-session-id header")
+    }
+
+    #[tokio::test]
+    async fn initialize_returns_session_and_capabilities() {
+        let mcp = middleware_with_echo_tool();
+
+        let body = br#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-06-18","capabilities":{}}}"#;
+        let result = mcp.handle_post_request(None, body).await;
+        let (status, body, session_id) = read_sse_response(result).await;
+
+        assert_eq!(status, 200);
+        assert!(session_id.is_some());
+        assert!(body.contains(r#""protocolVersion":"2025-06-18""#));
+        assert!(body.contains(r#""subscribe":true"#));
+        assert!(body.contains(r#""tools""#));
+    }
+
+    #[tokio::test]
+    async fn initialize_with_unknown_version_falls_back_to_latest() {
+        let mcp = middleware_with_echo_tool();
+
+        let body = br#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"1999-01-01","capabilities":{}}}"#;
+        let result = mcp.handle_post_request(None, body).await;
+        let (_, body, _) = read_sse_response(result).await;
+
+        assert!(body.contains(r#""protocolVersion":"2025-11-25""#));
+    }
+
+    #[tokio::test]
+    async fn initialize_with_stale_session_header_mints_new_session() {
+        let mcp = middleware_with_echo_tool();
+
+        let body = br#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-06-18","capabilities":{}}}"#;
+        let result = mcp.handle_post_request(Some("stale-session"), body).await;
+        let (status, _, session_id) = read_sse_response(result).await;
+
+        assert_eq!(status, 200);
+        assert!(session_id.is_some());
+        assert_ne!(session_id.unwrap(), "stale-session");
+    }
+
+    #[tokio::test]
+    async fn notifications_are_accepted_with_202() {
+        let mcp = middleware_with_echo_tool();
+        let session_id = initialize_session(&mcp).await;
+
+        for body in [
+            br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.as_slice(),
+            br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}"#
+                .as_slice(),
+        ] {
+            let result = mcp.handle_post_request(Some(session_id.as_str()), body).await;
+            let ok = result.expect("notification must be accepted");
+            assert_eq!(ok.output.get_status_code(), 202);
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_method_with_id_gets_method_not_found() {
+        let mcp = middleware_with_echo_tool();
+        let session_id = initialize_session(&mcp).await;
+
+        let body = br#"{"jsonrpc":"2.0","method":"logging/setLevel","id":7,"params":{"level":"debug"}}"#;
+        let result = mcp.handle_post_request(Some(session_id.as_str()), body).await;
+        let (status, body, _) = read_sse_response(result).await;
+
+        assert_eq!(status, 200);
+        assert!(body.contains(r#""code":-32601"#));
+        assert!(body.contains(r#""id":7"#));
+    }
+
+    #[tokio::test]
+    async fn missing_session_header_is_400() {
+        let mcp = middleware_with_echo_tool();
+
+        let body = br#"{"jsonrpc":"2.0","method":"tools/list","id":1}"#;
+        let result = mcp.handle_post_request(None, body).await;
+        let Err(err) = result else {
+            panic!("must be rejected");
+        };
+        assert_eq!(err.output.get_status_code(), 400);
+    }
+
+    #[tokio::test]
+    async fn unknown_session_is_404() {
+        let mcp = middleware_with_echo_tool();
+
+        let body = br#"{"jsonrpc":"2.0","method":"tools/list","id":1}"#;
+        let result = mcp.handle_post_request(Some("no-such-session"), body).await;
+        let Err(err) = result else {
+            panic!("must be rejected");
+        };
+        assert_eq!(err.output.get_status_code(), 404);
+    }
+
+    #[tokio::test]
+    async fn malformed_body_is_400_with_parse_error() {
+        let mcp = middleware_with_echo_tool();
+
+        let result = mcp.handle_post_request(None, b"this is not json").await;
+        let ok = result.expect("400 is returned as ok-result with JSON body");
+        match ok.output {
+            HttpOutput::Content {
+                status_code,
+                content,
+                ..
+            } => {
+                assert_eq!(status_code, 400);
+                let body = String::from_utf8(content).unwrap();
+                assert!(body.contains(r#""code":-32700"#));
+                assert!(body.contains(r#""id":null"#));
+            }
+            other => panic!("expected Content output, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_gets_invalid_params() {
+        let mcp = middleware_with_echo_tool();
+        let session_id = initialize_session(&mcp).await;
+
+        let body = br#"{"jsonrpc":"2.0","method":"tools/call","id":5,"params":{"name":"nope","arguments":{}}}"#;
+        let result = mcp.handle_post_request(Some(session_id.as_str()), body).await;
+        let (_, body, _) = read_sse_response(result).await;
+
+        assert!(body.contains(r#""code":-32602"#));
+        assert!(body.contains("Unknown tool: nope"));
+    }
+
+    #[tokio::test]
+    async fn tool_call_without_arguments_succeeds_and_streams_result() {
+        let mcp = middleware_with_echo_tool();
+        let session_id = initialize_session(&mcp).await;
+
+        let body = br#"{"jsonrpc":"2.0","method":"tools/call","id":6,"params":{"name":"echo"}}"#;
+        let result = mcp.handle_post_request(Some(session_id.as_str()), body).await;
+        let (status, body, _) = read_sse_response(result).await;
+
+        assert_eq!(status, 200);
+        assert!(body.contains(r#""isError":false"#));
+        assert!(body.contains(r#""echoed":"""#));
+    }
+
+    #[tokio::test]
+    async fn resource_templates_list_returns_empty_array() {
+        let mcp = middleware_with_echo_tool();
+        let session_id = initialize_session(&mcp).await;
+
+        let body = br#"{"jsonrpc":"2.0","method":"resources/templates/list","id":8}"#;
+        let result = mcp.handle_post_request(Some(session_id.as_str()), body).await;
+        let (_, body, _) = read_sse_response(result).await;
+
+        assert!(body.contains(r#""resourceTemplates":[]"#));
+    }
+
+    #[tokio::test]
+    async fn subscribe_unknown_resource_is_resource_not_found() {
+        let mcp = middleware_with_echo_tool();
+        let session_id = initialize_session(&mcp).await;
+
+        let body = br#"{"jsonrpc":"2.0","method":"resources/subscribe","id":9,"params":{"uri":"res://missing"}}"#;
+        let result = mcp.handle_post_request(Some(session_id.as_str()), body).await;
+        let (_, body, _) = read_sse_response(result).await;
+
+        assert!(body.contains(r#""code":-32002"#));
+    }
+
+    #[tokio::test]
+    async fn string_request_id_is_echoed_in_response() {
+        let mcp = middleware_with_echo_tool();
+        let session_id = initialize_session(&mcp).await;
+
+        let body = br#"{"jsonrpc":"2.0","method":"tools/list","id":"req-42"}"#;
+        let result = mcp.handle_post_request(Some(session_id.as_str()), body).await;
+        let (_, body, _) = read_sse_response(result).await;
+
+        assert!(body.contains(r#""id":"req-42""#));
     }
 }
