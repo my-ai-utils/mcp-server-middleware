@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use my_http_server::HttpContext;
 use parking_lot::Mutex;
-use rust_extensions::date_time::DateTimeAsMicroseconds;
+use rust_extensions::date_time::{AtomicDateTimeAsMicroseconds, DateTimeAsMicroseconds};
 
 use crate::mcp_middleware::{McpConnectionInfo, McpSocketUpdateEvent};
 
@@ -12,11 +12,10 @@ use crate::mcp_middleware::{McpConnectionInfo, McpSocketUpdateEvent};
 pub(crate) const GC_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// An MCP session as the outside world sees it: plain, cheap-to-clone
-/// data. The mutable runtime state — SSE channel, idle clock,
-/// subscriptions — stays in the private [`SessionEntry`], so handing an
-/// `McpSession` to a host can neither keep a stream alive nor run
-/// `Drop` in the host's hands.
-#[derive(Debug, Clone)]
+/// data. The mutable runtime state — SSE channel, subscriptions — stays
+/// in the private [`SessionEntry`], so handing an `McpSession` to a host
+/// can neither keep a stream alive nor run `Drop` in the host's hands.
+#[derive(Debug)]
 pub struct McpSession {
     pub id: String,
     pub version: String,
@@ -25,12 +24,55 @@ pub struct McpSession {
     /// time. Tools query this through `ToolCallContext` to decide
     /// whether to attempt `elicitation/create`.
     pub supports_elicitation: bool,
+    /// When a request last arrived on this session — any request,
+    /// `ping` included. It is the very value the GC compares against the
+    /// idle timeout, so a host showing it shows the number the sweeper
+    /// decides by, not a second opinion about it.
+    ///
+    /// Read it with `as_date_time()`. On a clone — which is what
+    /// [`McpSessions::get_sessions`] and the lifecycle hooks hand out —
+    /// it is a snapshot frozen at clone time, not a window into the
+    /// live entry.
+    pub last_access: AtomicDateTimeAsMicroseconds,
+}
+
+/// `AtomicDateTimeAsMicroseconds` is not `Clone`, and cloning it as a
+/// shared handle would turn every snapshot into a live view of the map.
+/// Copying the value keeps `McpSession` what it always was: data.
+impl Clone for McpSession {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            version: self.version.clone(),
+            create: self.create,
+            supports_elicitation: self.supports_elicitation,
+            last_access: AtomicDateTimeAsMicroseconds::new(
+                self.last_access.get_unix_microseconds(),
+            ),
+        }
+    }
+}
+
+impl McpSession {
+    fn new(
+        id: String,
+        version: String,
+        now: DateTimeAsMicroseconds,
+        supports_elicitation: bool,
+    ) -> Self {
+        Self {
+            id,
+            version,
+            create: now,
+            supports_elicitation,
+            last_access: AtomicDateTimeAsMicroseconds::new(now.unix_microseconds),
+        }
+    }
 }
 
 /// What the sessions map actually stores.
 struct SessionEntry {
     session: McpSession,
-    last_access: DateTimeAsMicroseconds,
     sender: Option<tokio::sync::mpsc::Sender<McpSocketUpdateEvent>>,
     /// Resource URIs this session subscribed to via
     /// `resources/subscribe`. `notify_resource_updated` fans
@@ -39,10 +81,9 @@ struct SessionEntry {
 }
 
 impl SessionEntry {
-    fn new(session: McpSession, now: DateTimeAsMicroseconds) -> Self {
+    fn new(session: McpSession) -> Self {
         Self {
             session,
-            last_access: now,
             sender: None,
             subscriptions: HashSet::new(),
         }
@@ -116,16 +157,16 @@ impl McpSessions {
         now: DateTimeAsMicroseconds,
         supports_elicitation: bool,
     ) -> McpSession {
-        let session = McpSession {
-            id: uuid::Uuid::new_v4().to_string(),
+        let session = McpSession::new(
+            uuid::Uuid::new_v4().to_string(),
             version,
-            create: now,
+            now,
             supports_elicitation,
-        };
+        );
 
         let mut write_access = self.data.lock();
 
-        write_access.insert(session.id.clone(), SessionEntry::new(session.clone(), now));
+        write_access.insert(session.id.clone(), SessionEntry::new(session.clone()));
 
         session
     }
@@ -144,18 +185,13 @@ impl McpSessions {
         let mut write_access = self.data.lock();
 
         if let Some(entry) = write_access.get_mut(session_id) {
-            entry.last_access = now;
+            entry.session.last_access.update(now);
             return None;
         }
 
-        let session = McpSession {
-            id: session_id.to_string(),
-            version,
-            create: now,
-            supports_elicitation,
-        };
+        let session = McpSession::new(session_id.to_string(), version, now, supports_elicitation);
 
-        write_access.insert(session.id.clone(), SessionEntry::new(session.clone(), now));
+        write_access.insert(session.id.clone(), SessionEntry::new(session.clone()));
 
         Some(session)
     }
@@ -186,7 +222,7 @@ impl McpSessions {
     ) -> Option<tokio::sync::mpsc::Receiver<McpSocketUpdateEvent>> {
         let mut write_access = self.data.lock();
         let session = write_access.get_mut(session_id)?;
-        session.last_access = now;
+        session.session.last_access.update(now);
         let (sender, receiver) = tokio::sync::mpsc::channel(32);
         session.sender = Some(sender);
         Some(receiver)
@@ -200,11 +236,34 @@ impl McpSessions {
         let mut write_access = self.data.lock();
 
         if let Some(session) = write_access.get_mut(session_id) {
-            session.last_access = now;
+            session.session.last_access.update(now);
             return true;
         }
 
         false
+    }
+
+    /// Snapshot of every live session, ordered oldest-first by `create`
+    /// (ties broken by id) so a host rendering it gets a stable list
+    /// instead of `HashMap`'s arbitrary order. The entries are owning
+    /// clones and the lock is released before returning — nothing here
+    /// keeps a session alive or observes it changing afterwards.
+    pub fn get_sessions(&self) -> Vec<McpSession> {
+        let mut result: Vec<McpSession> = {
+            let read_access = self.data.lock();
+            read_access
+                .values()
+                .map(|entry| entry.session.clone())
+                .collect()
+        };
+
+        result.sort_by(|left, right| {
+            left.create
+                .cmp(&right.create)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        result
     }
 
     pub async fn delete_session(&self, session_id: &str) -> bool {
@@ -307,7 +366,9 @@ impl McpSessions {
                 .iter()
                 .filter(|(_, entry)| {
                     entry.sender.is_none()
-                        && now.duration_since(entry.last_access).as_positive_or_zero()
+                        && now
+                            .duration_since(entry.session.last_access.as_date_time())
+                            .as_positive_or_zero()
                             >= idle_timeout
                 })
                 .map(|(id, _)| id.clone())
@@ -442,5 +503,82 @@ mod tests {
             .remove_idle_sessions(now, Duration::from_secs(1800))
             .await;
         assert_eq!(removed, 0);
+
+        // The very same refresh is what the outside world sees.
+        let visible = sessions.get_sessions();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(
+            visible[0].last_access.get_unix_microseconds(),
+            now.unix_microseconds
+        );
+        assert!(visible[0].last_access.as_date_time() > visible[0].create);
+    }
+
+    #[tokio::test]
+    async fn get_sessions_on_an_empty_server_is_an_empty_vec() {
+        let sessions = McpSessions::new();
+        assert!(sessions.get_sessions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn new_session_reports_last_access_equal_to_create() {
+        let sessions = McpSessions::new();
+        let now = DateTimeAsMicroseconds::now();
+
+        sessions.generate_session("2025-06-18".to_string(), now, false);
+
+        let visible = sessions.get_sessions();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].create.unix_microseconds, now.unix_microseconds);
+        assert_eq!(
+            visible[0].last_access.get_unix_microseconds(),
+            now.unix_microseconds
+        );
+    }
+
+    #[tokio::test]
+    async fn get_sessions_lists_live_sessions_oldest_first() {
+        let sessions = McpSessions::new();
+        let now = DateTimeAsMicroseconds::now();
+
+        // Inserted newest-first on purpose — the result must not depend
+        // on insertion (or HashMap) order.
+        let newest = sessions.generate_session("2025-06-18".to_string(), now, false);
+        let middle = sessions.generate_session("2025-06-18".to_string(), now_minus(60), false);
+        let oldest = sessions.generate_session("2025-06-18".to_string(), now_minus(120), false);
+
+        let ids: Vec<String> = sessions
+            .get_sessions()
+            .into_iter()
+            .map(|session| session.id)
+            .collect();
+        assert_eq!(ids, vec![oldest.id, middle.id, newest.id]);
+    }
+
+    #[tokio::test]
+    async fn get_sessions_drops_deleted_and_collected_sessions() {
+        let sessions = McpSessions::new();
+        let now = DateTimeAsMicroseconds::now();
+
+        let alive = sessions.generate_session("2025-06-18".to_string(), now, false);
+        let deleted = sessions.generate_session("2025-06-18".to_string(), now, false);
+        let collected = sessions.generate_session("2025-06-18".to_string(), now_minus(3600), false);
+
+        assert!(sessions.delete_session(deleted.id.as_str()).await);
+        assert_eq!(
+            sessions
+                .remove_idle_sessions(now, Duration::from_secs(1800))
+                .await,
+            1
+        );
+
+        let ids: Vec<String> = sessions
+            .get_sessions()
+            .into_iter()
+            .map(|session| session.id)
+            .collect();
+        assert_eq!(ids, vec![alive.id]);
+        assert!(!ids.contains(&deleted.id));
+        assert!(!ids.contains(&collected.id));
     }
 }

@@ -992,6 +992,32 @@ Sends `notifications/resources/updated` for `uri` to every live session
 that subscribed to it via `resources/subscribe`. Call it whenever the
 content behind a resource changes.
 
+#### `get_sessions()`
+
+Snapshot of every live session as a `Vec<McpSession>`, ordered
+oldest-first by `create` (ties broken by id). Takes `&self`, so a host
+that already handed its `Arc<McpMiddleware>` to `add_middleware` can poll
+it through that same `Arc`; the entries are owning clones and the
+internal lock is released before returning. An empty `Vec` when no
+session exists.
+
+This is the read-side counterpart of `McpConnectionInfo`: the hook tells
+the host *that* a session appeared or went away, `get_sessions()` tells
+it *what the sessions look like right now* — including
+`McpSession::last_access`. Pull, not a third event: it costs nothing on
+the request path, and a panel that refreshes every couple of seconds
+reads it exactly when it repaints.
+
+```rust
+for session in mcp.get_sessions() {
+    println!(
+        "{} idle for {} sec",
+        session.id,
+        DateTimeAsMicroseconds::now().seconds_before(session.last_access.as_date_time())
+    );
+}
+```
+
 #### `register_connection_info(connection_info)`
 
 Installs the host hook for session lifecycle events
@@ -1263,6 +1289,7 @@ Sessions are automatically managed by the middleware:
 * GET requests to the MCP path establish Server-Sent Events (SSE) streams for notifications
 * Sessions that have **no live SSE stream** and stay idle longer than the configured timeout are garbage-collected by a background sweeper (sweep interval 60s). The default idle timeout is 30 minutes; override it with `McpMiddleware::with_session_idle_timeout(Duration)`. Sessions with an open GET stream are never collected — a dead stream is detected within a couple of keepalive intervals and only then does the idle clock apply
 * `DELETE` with the session header terminates the session explicitly (`204`)
+* `McpMiddleware::get_sessions()` returns a snapshot of the live sessions at any moment, each carrying `last_access` — when a request last arrived on it, `ping` included
 
 ### Tracking live sessions from the host
 
@@ -1311,11 +1338,46 @@ Guarantees:
   request path is untouched
 
 `McpSession` is plain data (`id`, `version`, `create`,
-`supports_elicitation`) — a snapshot, not a handle into the live map.
+`supports_elicitation`, `last_access`) — a snapshot, not a handle into
+the live map.
 For the client name, re-read the `initialize` body from the context
 (it is already buffered) and parse it with `McpInputPayload::try_parse`;
 `InitializeMpcContract::client_info` carries `clientInfo.name` /
 `.version`.
+
+### Last activity per session
+
+`McpSession::last_access` is when a request last arrived on that session
+— *any* request, `ping` included, on the POST path as well as on the GET
+stream. It is an `AtomicDateTimeAsMicroseconds`; read it with
+`as_date_time()` (or `get_unix_microseconds()`). On a fresh session it
+equals `create`.
+
+There is deliberately no "request arrived" event to go with the two
+lifecycle ones — it would fire on every single request. Poll
+[`McpMiddleware::get_sessions()`](#get_sessions) instead, whenever the
+host actually needs the number:
+
+```rust
+let stale: Vec<String> = mcp
+    .get_sessions()
+    .into_iter()
+    .filter(|session| {
+        DateTimeAsMicroseconds::now().seconds_before(session.last_access.as_date_time()) > 60
+    })
+    .map(|session| session.id)
+    .collect();
+```
+
+This is the same field the idle GC compares against
+`with_session_idle_timeout` — so a panel built on it never shows "idle
+for 5 seconds" for a session the sweeper is about to collect. A host
+counting request arrivals in its own middleware would keep a second,
+slightly different number; this one is the one that decides.
+
+On a clone — and `get_sessions()` and both hooks hand out clones — the
+value is frozen at clone time. Re-read `get_sessions()` for a fresh one
+rather than holding an `McpSession` and expecting it to tick.
 
 ## Type Safety
 

@@ -101,6 +101,18 @@ impl McpMiddleware {
         self
     }
 
+    /// Snapshot of the sessions the middleware currently holds, oldest
+    /// `create` first (ties broken by id). Takes `&self`, so a host that
+    /// handed its `Arc<McpMiddleware>` to `add_middleware` can keep
+    /// polling it — pull costs nothing on the request path, unlike a
+    /// third lifecycle event that would fire on every single request.
+    ///
+    /// `McpSession::last_access` is the exact clock the idle GC decides
+    /// by, and it is refreshed by every request including `ping`.
+    pub fn get_sessions(&self) -> Vec<super::McpSession> {
+        self.sessions.get_sessions()
+    }
+
     /// Pushes `notifications/resources/updated` for `uri` to every live
     /// session that subscribed to it via `resources/subscribe`. Call it
     /// whenever the content behind a resource changes.
@@ -1266,6 +1278,92 @@ mod tests {
         assert!(!mcp
             .sessions
             .check_session_and_update_last_used(other.as_str(), later));
+    }
+
+    /// The one live session, or a panic — every caller below runs
+    /// against a middleware that has exactly one.
+    fn only_session(mcp: &McpMiddleware) -> McpSession {
+        let mut sessions = mcp.get_sessions();
+        assert_eq!(sessions.len(), 1);
+        sessions.remove(0)
+    }
+
+    #[tokio::test]
+    async fn fresh_session_starts_with_last_access_at_create_time() {
+        let mcp = middleware_with_echo_tool();
+        let session_id = initialize_session(&mcp).await;
+
+        let session = only_session(&mcp);
+        assert_eq!(session.id, session_id);
+        assert_eq!(
+            session.last_access.get_unix_microseconds(),
+            session.create.unix_microseconds
+        );
+    }
+
+    #[tokio::test]
+    async fn a_regular_request_moves_last_access() {
+        let mcp = middleware_with_echo_tool();
+        let session_id = initialize_session(&mcp).await;
+        let before = only_session(&mcp).last_access.get_unix_microseconds();
+
+        let body = br#"{"jsonrpc":"2.0","method":"tools/list","id":2}"#;
+        let result = mcp
+            .handle_post_request(Some(session_id.as_str()), body, None)
+            .await;
+        let (status, _, _) = read_sse_response(result).await;
+        assert_eq!(status, 200);
+
+        let session = only_session(&mcp);
+        assert!(session.last_access.get_unix_microseconds() > before);
+        // ...and `create` stays put, so the two are now distinguishable.
+        assert!(session.last_access.as_date_time() > session.create);
+    }
+
+    /// The whole point of exposing `last_access`: a client that only
+    /// pings is alive, and the host must be able to see that.
+    #[tokio::test]
+    async fn ping_moves_last_access() {
+        let mcp = middleware_with_echo_tool();
+        let session_id = initialize_session(&mcp).await;
+        let before = only_session(&mcp).last_access.get_unix_microseconds();
+
+        let body = br#"{"jsonrpc":"2.0","method":"ping","id":3}"#;
+        let result = mcp
+            .handle_post_request(Some(session_id.as_str()), body, None)
+            .await;
+        let (status, _, _) = read_sse_response(result).await;
+        assert_eq!(status, 200);
+
+        assert!(only_session(&mcp).last_access.get_unix_microseconds() > before);
+    }
+
+    #[tokio::test]
+    async fn get_sessions_reflects_deleted_and_collected_sessions() {
+        let mcp = middleware_with_echo_tool();
+        assert!(mcp.get_sessions().is_empty());
+
+        let deleted = initialize_session(&mcp).await;
+        let collected = initialize_session(&mcp).await;
+        assert_eq!(mcp.get_sessions().len(), 2);
+
+        assert!(mcp.sessions.delete_session(deleted.as_str()).await);
+        let ids: Vec<String> = mcp
+            .get_sessions()
+            .into_iter()
+            .map(|session| session.id)
+            .collect();
+        assert_eq!(ids, vec![collected]);
+
+        let mut later = DateTimeAsMicroseconds::now();
+        later.add_seconds(3600);
+        assert_eq!(
+            mcp.sessions
+                .remove_idle_sessions(later, Duration::from_secs(1800))
+                .await,
+            1
+        );
+        assert!(mcp.get_sessions().is_empty());
     }
 
     #[tokio::test]
