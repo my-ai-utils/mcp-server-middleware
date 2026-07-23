@@ -37,6 +37,10 @@ pub struct McpMiddleware {
     /// Sessions idle longer than this (and without a live SSE channel)
     /// are garbage-collected. See [`Self::with_session_idle_timeout`].
     session_idle_timeout: Duration,
+    /// When on (the default), a non-`initialize` request carrying an
+    /// unknown `mcp-session-id` adopts that id instead of getting a
+    /// `404`. See [`Self::disabled_lazy_session_creation`].
+    lazy_session_creation: bool,
     /// The GC task is started lazily on the first request, which is
     /// guaranteed to run inside the tokio runtime (unlike `new()`).
     gc_started: AtomicBool,
@@ -63,6 +67,7 @@ impl McpMiddleware {
             dynamic_resources: Arc::new(tokio::sync::RwLock::new(DynamicResources::new())),
             elicitations: Arc::new(McpElicitations::new()),
             session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
+            lazy_session_creation: true,
             gc_started: AtomicBool::new(false),
         }
     }
@@ -71,6 +76,16 @@ impl McpMiddleware {
     /// SSE stream) before the background GC drops it. Default: 30 min.
     pub fn with_session_idle_timeout(mut self, timeout: Duration) -> Self {
         self.session_idle_timeout = timeout;
+        self
+    }
+
+    /// Turns lazy session creation off and restores the spec behavior:
+    /// a non-`initialize` request whose `mcp-session-id` is unknown gets
+    /// `404` so the client re-runs `initialize`. By default the id is
+    /// adopted instead and the request is served, which keeps clients
+    /// working across a server restart or a GC'd session.
+    pub fn disabled_lazy_session_creation(mut self) -> Self {
+        self.lazy_session_creation = false;
         self
     }
 
@@ -629,9 +644,22 @@ impl McpMiddleware {
             .sessions
             .check_session_and_update_last_used(session_id, now)
         {
-            // Spec: 404 signals the session is gone and the client
-            // should start over with a new `initialize`.
-            return Err(HttpFailResult::as_not_found("Unknown MCP session", false));
+            if !self.lazy_session_creation {
+                // Spec: 404 signals the session is gone and the client
+                // should start over with a new `initialize`.
+                return Err(HttpFailResult::as_not_found("Unknown MCP session", false));
+            }
+
+            // Lazy session creation: adopt the id the client already
+            // holds (server restart, GC'd session) and serve the request
+            // as if `initialize` had just run — latest protocol version,
+            // no elicitation support until the client says otherwise.
+            self.sessions.ensure_session_with_id(
+                session_id,
+                super::mcp_output_contract::latest_protocol_version().to_string(),
+                now,
+                false,
+            );
         }
 
         self.handle_authorized_request(session_id, data, now, &id)
@@ -958,8 +986,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_session_is_404() {
-        let mcp = middleware_with_echo_tool();
+    async fn unknown_session_is_404_when_lazy_creation_is_disabled() {
+        let mcp = middleware_with_echo_tool().disabled_lazy_session_creation();
 
         let body = br#"{"jsonrpc":"2.0","method":"tools/list","id":1}"#;
         let result = mcp.handle_post_request(Some("no-such-session"), body).await;
@@ -967,6 +995,39 @@ mod tests {
             panic!("must be rejected");
         };
         assert_eq!(err.output.get_status_code(), 404);
+    }
+
+    #[tokio::test]
+    async fn unknown_session_is_adopted_by_default() {
+        let mcp = middleware_with_echo_tool();
+
+        let body = br#"{"jsonrpc":"2.0","method":"tools/list","id":1}"#;
+        let result = mcp.handle_post_request(Some("client-owned-id"), body).await;
+        let (status, body, session_id) = read_sse_response(result).await;
+
+        assert_eq!(status, 200);
+        // The client-supplied id is kept as-is, not replaced by a new one.
+        assert_eq!(session_id.as_deref(), Some("client-owned-id"));
+        assert!(body.contains(r#""echo""#));
+
+        // The session is now a regular one: it survives to the next request.
+        let now = DateTimeAsMicroseconds::now();
+        assert!(
+            mcp.sessions
+                .check_session_and_update_last_used("client-owned-id", now)
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_session_header_stays_400_with_lazy_creation() {
+        let mcp = middleware_with_echo_tool();
+
+        let body = br#"{"jsonrpc":"2.0","method":"tools/list","id":1}"#;
+        let result = mcp.handle_post_request(None, body).await;
+        let Err(err) = result else {
+            panic!("must be rejected");
+        };
+        assert_eq!(err.output.get_status_code(), 400);
     }
 
     #[tokio::test]

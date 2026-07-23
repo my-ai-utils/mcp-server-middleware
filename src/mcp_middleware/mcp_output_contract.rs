@@ -16,6 +16,13 @@ pub const JSONRPC_RESOURCE_NOT_FOUND: i64 = -32002;
 /// requests a version we don't know.
 pub const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = ["2025-03-26", "2025-06-18", "2025-11-25"];
 
+/// The newest revision this middleware implements. Also the version
+/// assumed for a session that never went through `initialize` (lazy
+/// session creation).
+pub fn latest_protocol_version() -> &'static str {
+    SUPPORTED_PROTOCOL_VERSIONS[SUPPORTED_PROTOCOL_VERSIONS.len() - 1]
+}
+
 /// Per spec: echo the requested version when supported, otherwise
 /// respond with the latest version the server supports — the client
 /// then decides whether it can keep talking.
@@ -23,7 +30,7 @@ pub fn negotiate_protocol_version(requested: &str) -> &str {
     if SUPPORTED_PROTOCOL_VERSIONS.contains(&requested) {
         return requested;
     }
-    SUPPORTED_PROTOCOL_VERSIONS[SUPPORTED_PROTOCOL_VERSIONS.len() - 1]
+    latest_protocol_version()
 }
 
 pub fn compile_init_response(

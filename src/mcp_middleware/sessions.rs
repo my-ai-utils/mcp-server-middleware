@@ -71,6 +71,39 @@ impl McpSessions {
         id
     }
 
+    /// Registers a session under a client-supplied id (lazy session
+    /// creation). Never overwrites an existing session — a concurrent
+    /// request that already created it just refreshes `last_access`.
+    /// Returns true when a new session was actually minted.
+    pub fn ensure_session_with_id(
+        &self,
+        session_id: &str,
+        version: String,
+        now: DateTimeAsMicroseconds,
+        supports_elicitation: bool,
+    ) -> bool {
+        let mut write_access = self.data.lock();
+
+        if let Some(session) = write_access.get_mut(session_id) {
+            session.last_access = now;
+            return false;
+        }
+
+        write_access.insert(
+            session_id.to_string(),
+            McpSession {
+                version,
+                create: now,
+                last_access: now,
+                sender: None,
+                supports_elicitation,
+                subscriptions: HashSet::new(),
+            },
+        );
+
+        true
+    }
+
     pub fn session_supports_elicitation(&self, session_id: &str) -> bool {
         let access = self.data.lock();
         access

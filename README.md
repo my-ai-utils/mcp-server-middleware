@@ -73,7 +73,7 @@ This middleware (`mcp-server-middleware`) is a **Rust library** that provides a 
 - Notifications (`notifications/*`) accepted with `202`; unknown request methods answered with JSON-RPC `-32601`
 - Proper JSON-RPC 2.0 formatting, including string request ids and spec-shaped `error: {code, message}` objects
 - SSE streaming support with keepalives on both the GET notification stream and long `tools/call` responses
-- Session management with secure session IDs, `404` for expired sessions (clients auto-reinitialize) and background GC for abandoned sessions
+- Session management with secure session IDs, lazy adoption of unknown session IDs (opt out with `disabled_lazy_session_creation()` to get the spec `404` back) and background GC for abandoned sessions
 
 **Integration**:
 - Seamless integration with `my-http-server` as HTTP middleware
@@ -997,6 +997,29 @@ Builder-style override for the session GC idle timeout (default 30
 minutes). Sessions without a live SSE stream that stay untouched longer
 than this are dropped by the background sweeper.
 
+#### `disabled_lazy_session_creation()`
+
+Builder-style switch that turns **lazy session creation** off.
+
+By default (lazy session creation **on**) a non-`initialize` request
+carrying an `mcp-session-id` the server does not know is not rejected:
+the middleware creates a session under exactly that id — same defaults as
+right after `initialize` (latest protocol version, no elicitation
+support) — and serves the request normally. This keeps clients alive
+across a server restart or a GC'd session without a re-`initialize`
+round-trip.
+
+Call `disabled_lazy_session_creation()` to restore the spec behavior,
+where such a request gets `404` and the client re-runs `initialize`:
+
+```rust
+let mcp = McpMiddleware::new("/mcp", "my-server", "1.0.0", "instructions")
+    .disabled_lazy_session_creation();
+```
+
+A request with **no** `mcp-session-id` header at all is still rejected
+with `400` in both modes.
+
 ### `McpToolCall` Trait
 
 Trait that must be implemented by your tool services:
@@ -1198,7 +1221,8 @@ The middleware implements the MCP Streamable HTTP transport (protocol revisions 
 | Notification or client JSON-RPC response accepted | `202` |
 | Missing `mcp-session-id` header (non-initialize) | `400` |
 | Unparsable JSON-RPC body | `400` + JSON-RPC `-32700` body |
-| Unknown / expired session (POST, GET, DELETE) | `404` — per spec the client re-initializes |
+| Unknown / expired session (POST) | `200` — the id is adopted and the request served (default); `404` with `disabled_lazy_session_creation()` |
+| Unknown / expired session (GET, DELETE) | `404` — per spec the client re-initializes |
 | Session deleted via DELETE | `204` |
 
 `initialize` is accepted with or without a (possibly stale) session header and always mints a fresh session.
@@ -1210,6 +1234,7 @@ Sessions are automatically managed by the middleware:
 * Each `initialize` request creates a new session with a unique session ID
 * Session IDs are returned in the `mcp-session-id` HTTP header
 * Subsequent requests must include the session ID in the `mcp-session-id` header
+* By default a POST whose `mcp-session-id` is unknown to the server creates a session under that very id (lazy session creation) instead of failing with `404`; turn it off with `McpMiddleware::disabled_lazy_session_creation()`
 * GET requests to the MCP path establish Server-Sent Events (SSE) streams for notifications
 * Sessions that have **no live SSE stream** and stay idle longer than the configured timeout are garbage-collected by a background sweeper (sweep interval 60s). The default idle timeout is 30 minutes; override it with `McpMiddleware::with_session_idle_timeout(Duration)`. Sessions with an open GET stream are never collected — a dead stream is detected within a couple of keepalive intervals and only then does the idle clock apply
 * `DELETE` with the session header terminates the session explicitly (`204`)
