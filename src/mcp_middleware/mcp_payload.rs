@@ -306,6 +306,25 @@ pub struct InitializeMpcContract {
     pub protocol_version: String,
     #[serde(default)]
     pub capabilities: ClientCapabilities,
+    /// Who is on the other end. The middleware itself does not use it;
+    /// it is kept so a host that re-parses the `initialize` body from
+    /// the [`crate::McpConnectionInfo::on_connected`] context can name
+    /// the client without writing its own contract.
+    #[serde(rename = "clientInfo", default)]
+    pub client_info: Option<ClientInfo>,
+}
+
+/// `clientInfo` of the `initialize` request. Everything is optional —
+/// the spec requires `name` and `version`, but a missing one must not
+/// fail the handshake.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct ClientInfo {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 /// Subset of client capabilities the server cares about. Unknown fields
@@ -341,6 +360,30 @@ mod tests {
                 assert!(c.capabilities.elicitation.is_some(),
                     "elicitation capability not picked up");
             }
+            other => panic!("expected Initialize, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn initialize_keeps_client_info() {
+        let payload = r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"claude-code","version":"0.5.0"}}}"#;
+        let parsed = McpInputPayload::try_parse(payload.as_bytes()).unwrap();
+        match parsed.data {
+            McpInputData::Initialize(c) => {
+                let client_info = c.client_info.expect("clientInfo must be kept");
+                assert_eq!(client_info.name.as_deref(), Some("claude-code"));
+                assert_eq!(client_info.version.as_deref(), Some("0.5.0"));
+            }
+            other => panic!("expected Initialize, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn initialize_without_client_info_is_accepted() {
+        let payload = r#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-06-18","capabilities":{}}}"#;
+        let parsed = McpInputPayload::try_parse(payload.as_bytes()).unwrap();
+        match parsed.data {
+            McpInputData::Initialize(c) => assert!(c.client_info.is_none()),
             other => panic!("expected Initialize, got {:?}", other),
         }
     }

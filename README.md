@@ -100,6 +100,7 @@ This middleware (`mcp-server-middleware`) is a **Rust library** that provides a 
 * **Type-Safe Tool Definitions**: Leverages `my-ai-agent` for type-safe JSON schema generation
 * **Dynamic Enumeration**: Support for dynamically generated enum values based on runtime data
 * **Elicitation** (server→client user input): tools that implement `McpToolCallEx` can request a value from the user mid-execution via `ToolCallContext::elicit()`. Requires the client to advertise `capabilities.elicitation` at initialize. Useful for credentials and confirmations that should never enter the LLM context.
+* **Session lifecycle events**: register an `McpConnectionInfo` hook to be told when a session appears (with the request that created it) and when it is gone — enough to keep a live "who is connected" list in the host.
 
 ## Installation
 
@@ -991,6 +992,13 @@ Sends `notifications/resources/updated` for `uri` to every live session
 that subscribed to it via `resources/subscribe`. Call it whenever the
 content behind a resource changes.
 
+#### `register_connection_info(connection_info)`
+
+Installs the host hook for session lifecycle events
+(`Arc<dyn McpConnectionInfo + Send + Sync + 'static>`). Optional, and
+only the first registration is kept. See
+[Tracking live sessions from the host](#tracking-live-sessions-from-the-host).
+
 #### `with_session_idle_timeout(timeout)`
 
 Builder-style override for the session GC idle timeout (default 30
@@ -1019,6 +1027,23 @@ let mcp = McpMiddleware::new("/mcp", "my-server", "1.0.0", "instructions")
 
 A request with **no** `mcp-session-id` header at all is still rejected
 with `400` in both modes.
+
+### `McpConnectionInfo` Trait
+
+Optional host hook for the session lifecycle:
+
+```rust
+#[async_trait::async_trait]
+pub trait McpConnectionInfo {
+    /// A session appeared — `ctx` is the POST request that created it.
+    async fn on_connected(&self, session: &McpSession, ctx: &mut HttpContext);
+
+    /// The session is gone; the reason is not exposed on purpose.
+    async fn on_disconnected(&self, session: &McpSession);
+}
+```
+
+Register it with `McpMiddleware::register_connection_info()`.
 
 ### `McpToolCall` Trait
 
@@ -1238,6 +1263,59 @@ Sessions are automatically managed by the middleware:
 * GET requests to the MCP path establish Server-Sent Events (SSE) streams for notifications
 * Sessions that have **no live SSE stream** and stay idle longer than the configured timeout are garbage-collected by a background sweeper (sweep interval 60s). The default idle timeout is 30 minutes; override it with `McpMiddleware::with_session_idle_timeout(Duration)`. Sessions with an open GET stream are never collected — a dead stream is detected within a couple of keepalive intervals and only then does the idle clock apply
 * `DELETE` with the session header terminates the session explicitly (`204`)
+
+### Tracking live sessions from the host
+
+A host that wants its own list of live MCP sessions (an admin panel, for
+instance) registers an `McpConnectionInfo` hook. There are exactly two
+events, and *why* a session disappeared — `DELETE`, idle timeout,
+process restart — stays the middleware's business:
+
+```rust
+use mcp_server_middleware::*;
+use mcp_server_middleware::my_http_server::{HttpContext, async_trait};
+
+pub struct SessionsPanel;
+
+#[async_trait::async_trait]
+impl McpConnectionInfo for SessionsPanel {
+    async fn on_connected(&self, session: &McpSession, ctx: &mut HttpContext) {
+        // Everything about the request that created the session is here.
+        let ip = ctx.request.get_ip().get_real_ip_as_string();
+        let country = ctx
+            .request
+            .get_headers()
+            .try_get_case_insensitive("cf-ipcountry")
+            .and_then(|value| value.as_str().ok().map(|value| value.to_string()));
+
+        println!("{} connected from {} ({:?})", session.id, ip, country);
+    }
+
+    async fn on_disconnected(&self, session: &McpSession) {
+        println!("{} is gone", session.id);
+    }
+}
+
+mcp.register_connection_info(Arc::new(SessionsPanel));
+```
+
+Guarantees:
+
+* `on_connected` fires exactly once per session — both for `initialize`
+  and for a lazily adopted `mcp-session-id`
+* `on_disconnected` fires at most once per session, and never for a
+  session that was not announced by `on_connected`
+* both run with no internal lock held, so the implementation may await
+  and take its own locks freely
+* the hook is optional: with none registered nothing is fired and the
+  request path is untouched
+
+`McpSession` is plain data (`id`, `version`, `create`,
+`supports_elicitation`) — a snapshot, not a handle into the live map.
+For the client name, re-read the `initialize` body from the context
+(it is already buffered) and parse it with `McpInputPayload::try_parse`;
+`InitializeMpcContract::client_info` carries `clientInfo.name` /
+`.version`.
 
 ## Type Safety
 

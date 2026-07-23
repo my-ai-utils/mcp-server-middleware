@@ -7,12 +7,12 @@ use rust_extensions::date_time::DateTimeAsMicroseconds;
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::mcp_middleware::{
-    DynamicResourceExecutor, DynamicResources, InitializeMpcContract, McpElicitations,
-    McpInputData, McpInputPayload, McpPromptService, McpPrompts, McpResourceService, McpResources,
-    McpSessions, McpToolCallExWithInstruction, McpToolCallWithInstruction, McpToolCalls,
-    PromptDefinition, PromptExecutor, RequestId, ResourceDefinition, ResourceExecutor,
-    ResourceIcon, SESSION_HEADER, ToolCallContext, ToolCallExecutor, ToolCallExecutorEx,
-    parse_elicitation_response,
+    DynamicResourceExecutor, DynamicResources, InitializeMpcContract, McpConnectionInfo,
+    McpElicitations, McpInputData, McpInputPayload, McpPromptService, McpPrompts,
+    McpResourceService, McpResources, McpSessions, McpToolCallExWithInstruction,
+    McpToolCallWithInstruction, McpToolCalls, PromptDefinition, PromptExecutor, RequestId,
+    ResourceDefinition, ResourceExecutor, ResourceIcon, SESSION_HEADER, ToolCallContext,
+    ToolCallExecutor, ToolCallExecutorEx, parse_elicitation_response,
 };
 
 use my_ai_agent::{ToolDefinition, json_schema::*};
@@ -77,6 +77,18 @@ impl McpMiddleware {
     pub fn with_session_idle_timeout(mut self, timeout: Duration) -> Self {
         self.session_idle_timeout = timeout;
         self
+    }
+
+    /// Registers the host hook for session lifecycle events — a session
+    /// appeared (together with the request that created it) and a
+    /// session is gone. Optional: without it nothing is fired and the
+    /// request path stays exactly as it was. Only the first
+    /// registration is kept.
+    pub fn register_connection_info(
+        &mut self,
+        connection_info: Arc<dyn McpConnectionInfo + Send + Sync + 'static>,
+    ) {
+        self.sessions.set_connection_info(connection_info);
     }
 
     /// Turns lazy session creation off and restores the spec behavior:
@@ -267,6 +279,7 @@ impl McpMiddleware {
         contract: InitializeMpcContract,
         now: DateTimeAsMicroseconds,
         id: &RequestId,
+        ctx: Option<&mut HttpContext>,
     ) -> Result<HttpOkResult, HttpFailResult> {
         let protocol_version = super::mcp_output_contract::negotiate_protocol_version(
             contract.protocol_version.as_str(),
@@ -284,11 +297,18 @@ impl McpMiddleware {
         );
 
         let supports_elicitation = contract.capabilities.elicitation.is_some();
-        let session_id = self
+        let session = self
             .sessions
             .generate_session(protocol_version, now, supports_elicitation);
 
-        send_response_as_stream(response, session_id.as_str(), now)
+        // A session appeared. `ctx` is None only when the middleware is
+        // driven directly from a unit test; on the wire `initialize`
+        // always arrives with its request context.
+        if let Some(ctx) = ctx {
+            self.sessions.notify_connected(&session, ctx).await;
+        }
+
+        send_response_as_stream(response, session.id.as_str(), now)
     }
 
     async fn handle_authorized_request(
@@ -297,10 +317,11 @@ impl McpMiddleware {
         data: McpInputData,
         now: DateTimeAsMicroseconds,
         id: &RequestId,
+        ctx: Option<&mut HttpContext>,
     ) -> Result<HttpOkResult, HttpFailResult> {
         match data {
             super::McpInputData::Initialize(contract) => {
-                return self.handle_initialize(contract, now, id).await;
+                return self.handle_initialize(contract, now, id, ctx).await;
             }
 
             super::McpInputData::ResourcesList(params) => {
@@ -602,6 +623,7 @@ impl McpMiddleware {
         &self,
         session_id: Option<&str>,
         body: &[u8],
+        mut ctx: Option<&mut HttpContext>,
     ) -> Result<HttpOkResult, HttpFailResult> {
         let now = DateTimeAsMicroseconds::now();
 
@@ -629,7 +651,7 @@ impl McpMiddleware {
         // `initialize` is valid both with and without a session header —
         // a stale header must not block a client from re-initializing.
         if let super::McpInputData::Initialize(contract) = data {
-            return self.handle_initialize(contract, now, &id).await;
+            return self.handle_initialize(contract, now, &id, ctx).await;
         }
 
         let Some(session_id) = session_id else {
@@ -654,15 +676,23 @@ impl McpMiddleware {
             // holds (server restart, GC'd session) and serve the request
             // as if `initialize` had just run — latest protocol version,
             // no elicitation support until the client says otherwise.
-            self.sessions.ensure_session_with_id(
+            let created = self.sessions.ensure_session_with_id(
                 session_id,
                 super::mcp_output_contract::latest_protocol_version().to_string(),
                 now,
                 false,
             );
+
+            // Adopting an id is a session appearing just as much as
+            // `initialize` is — the host must hear about it.
+            if let Some(session) = created {
+                if let Some(ctx) = ctx.as_deref_mut() {
+                    self.sessions.notify_connected(&session, ctx).await;
+                }
+            }
         }
 
-        self.handle_authorized_request(session_id, data, now, &id)
+        self.handle_authorized_request(session_id, data, now, &id, ctx)
             .await
     }
 }
@@ -768,6 +798,25 @@ impl HttpServerMiddleware for McpMiddleware {
                 );
             }
             Method::POST => {
+                // A registered connection-info hook is handed the whole
+                // HttpContext, which can not be borrowed while the
+                // reference returned by `get_body()` is alive — so for
+                // listening hosts the body is copied once. With no hook
+                // the zero-copy path is untouched.
+                if self.sessions.has_connection_info() {
+                    let body = match ctx.request.get_body().await {
+                        Ok(body) => body.as_slice().to_vec(),
+                        Err(err) => {
+                            return Some(Err(err));
+                        }
+                    };
+
+                    let result = self
+                        .handle_post_request(session_id.as_deref(), body.as_slice(), Some(ctx))
+                        .await;
+                    return Some(result);
+                }
+
                 let body = match ctx.request.get_body().await {
                     Ok(body) => body,
                     Err(err) => {
@@ -776,7 +825,7 @@ impl HttpServerMiddleware for McpMiddleware {
                 };
 
                 let result = self
-                    .handle_post_request(session_id.as_deref(), body.as_slice())
+                    .handle_post_request(session_id.as_deref(), body.as_slice(), None)
                     .await;
                 return Some(result);
             }
@@ -788,7 +837,7 @@ impl HttpServerMiddleware for McpMiddleware {
                     );
                 };
 
-                let removed = self.sessions.delete_session(session_id.as_str());
+                let removed = self.sessions.delete_session(session_id.as_str()).await;
 
                 if !removed {
                     return Some(
@@ -815,7 +864,7 @@ impl HttpServerMiddleware for McpMiddleware {
 mod tests {
     use super::*;
     use crate::ToolDefinition;
-    use crate::mcp_middleware::McpToolCall;
+    use crate::mcp_middleware::{McpSession, McpToolCall};
     use my_ai_agent::json_schema::JsonTypeDescription;
 
     #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -873,6 +922,36 @@ mod tests {
         mcp
     }
 
+    /// Records the lifecycle events the middleware fires. `on_connected`
+    /// needs a real `HttpContext`, which only a real request can produce
+    /// — it is covered by `tests/session_lifecycle.rs`.
+    #[derive(Default)]
+    struct RecordingConnectionInfo {
+        disconnected: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl RecordingConnectionInfo {
+        fn disconnected(&self) -> Vec<String> {
+            self.disconnected.lock().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl McpConnectionInfo for RecordingConnectionInfo {
+        async fn on_connected(&self, _session: &McpSession, _ctx: &mut HttpContext) {}
+
+        async fn on_disconnected(&self, session: &McpSession) {
+            self.disconnected.lock().push(session.id.clone());
+        }
+    }
+
+    fn middleware_with_recorder() -> (McpMiddleware, Arc<RecordingConnectionInfo>) {
+        let recorder = Arc::new(RecordingConnectionInfo::default());
+        let mut mcp = middleware_with_echo_tool();
+        mcp.register_connection_info(recorder.clone());
+        (mcp, recorder)
+    }
+
     /// Drains an SSE (`HttpOutput::Raw`) response: returns
     /// (status, body, mcp-session-id header).
     async fn read_sse_response(
@@ -898,7 +977,7 @@ mod tests {
 
     async fn initialize_session(mcp: &McpMiddleware) -> String {
         let body = br#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-06-18","capabilities":{}}}"#;
-        let result = mcp.handle_post_request(None, body).await;
+        let result = mcp.handle_post_request(None, body, None).await;
         let (status, _, session_id) = read_sse_response(result).await;
         assert_eq!(status, 200);
         session_id.expect("initialize must return mcp-session-id header")
@@ -909,7 +988,7 @@ mod tests {
         let mcp = middleware_with_echo_tool();
 
         let body = br#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-06-18","capabilities":{}}}"#;
-        let result = mcp.handle_post_request(None, body).await;
+        let result = mcp.handle_post_request(None, body, None).await;
         let (status, body, session_id) = read_sse_response(result).await;
 
         assert_eq!(status, 200);
@@ -924,7 +1003,7 @@ mod tests {
         let mcp = middleware_with_echo_tool();
 
         let body = br#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"1999-01-01","capabilities":{}}}"#;
-        let result = mcp.handle_post_request(None, body).await;
+        let result = mcp.handle_post_request(None, body, None).await;
         let (_, body, _) = read_sse_response(result).await;
 
         assert!(body.contains(r#""protocolVersion":"2025-11-25""#));
@@ -935,7 +1014,7 @@ mod tests {
         let mcp = middleware_with_echo_tool();
 
         let body = br#"{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-06-18","capabilities":{}}}"#;
-        let result = mcp.handle_post_request(Some("stale-session"), body).await;
+        let result = mcp.handle_post_request(Some("stale-session"), body, None).await;
         let (status, _, session_id) = read_sse_response(result).await;
 
         assert_eq!(status, 200);
@@ -953,7 +1032,7 @@ mod tests {
             br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}"#
                 .as_slice(),
         ] {
-            let result = mcp.handle_post_request(Some(session_id.as_str()), body).await;
+            let result = mcp.handle_post_request(Some(session_id.as_str()), body, None).await;
             let ok = result.expect("notification must be accepted");
             assert_eq!(ok.output.get_status_code(), 202);
         }
@@ -965,7 +1044,7 @@ mod tests {
         let session_id = initialize_session(&mcp).await;
 
         let body = br#"{"jsonrpc":"2.0","method":"logging/setLevel","id":7,"params":{"level":"debug"}}"#;
-        let result = mcp.handle_post_request(Some(session_id.as_str()), body).await;
+        let result = mcp.handle_post_request(Some(session_id.as_str()), body, None).await;
         let (status, body, _) = read_sse_response(result).await;
 
         assert_eq!(status, 200);
@@ -978,7 +1057,7 @@ mod tests {
         let mcp = middleware_with_echo_tool();
 
         let body = br#"{"jsonrpc":"2.0","method":"tools/list","id":1}"#;
-        let result = mcp.handle_post_request(None, body).await;
+        let result = mcp.handle_post_request(None, body, None).await;
         let Err(err) = result else {
             panic!("must be rejected");
         };
@@ -990,7 +1069,7 @@ mod tests {
         let mcp = middleware_with_echo_tool().disabled_lazy_session_creation();
 
         let body = br#"{"jsonrpc":"2.0","method":"tools/list","id":1}"#;
-        let result = mcp.handle_post_request(Some("no-such-session"), body).await;
+        let result = mcp.handle_post_request(Some("no-such-session"), body, None).await;
         let Err(err) = result else {
             panic!("must be rejected");
         };
@@ -1002,7 +1081,7 @@ mod tests {
         let mcp = middleware_with_echo_tool();
 
         let body = br#"{"jsonrpc":"2.0","method":"tools/list","id":1}"#;
-        let result = mcp.handle_post_request(Some("client-owned-id"), body).await;
+        let result = mcp.handle_post_request(Some("client-owned-id"), body, None).await;
         let (status, body, session_id) = read_sse_response(result).await;
 
         assert_eq!(status, 200);
@@ -1023,7 +1102,7 @@ mod tests {
         let mcp = middleware_with_echo_tool();
 
         let body = br#"{"jsonrpc":"2.0","method":"tools/list","id":1}"#;
-        let result = mcp.handle_post_request(None, body).await;
+        let result = mcp.handle_post_request(None, body, None).await;
         let Err(err) = result else {
             panic!("must be rejected");
         };
@@ -1034,7 +1113,7 @@ mod tests {
     async fn malformed_body_is_400_with_parse_error() {
         let mcp = middleware_with_echo_tool();
 
-        let result = mcp.handle_post_request(None, b"this is not json").await;
+        let result = mcp.handle_post_request(None, b"this is not json", None).await;
         let ok = result.expect("400 is returned as ok-result with JSON body");
         match ok.output {
             HttpOutput::Content {
@@ -1057,7 +1136,7 @@ mod tests {
         let session_id = initialize_session(&mcp).await;
 
         let body = br#"{"jsonrpc":"2.0","method":"tools/call","id":5,"params":{"name":"nope","arguments":{}}}"#;
-        let result = mcp.handle_post_request(Some(session_id.as_str()), body).await;
+        let result = mcp.handle_post_request(Some(session_id.as_str()), body, None).await;
         let (_, body, _) = read_sse_response(result).await;
 
         assert!(body.contains(r#""code":-32602"#));
@@ -1070,7 +1149,7 @@ mod tests {
         let session_id = initialize_session(&mcp).await;
 
         let body = br#"{"jsonrpc":"2.0","method":"tools/call","id":6,"params":{"name":"echo"}}"#;
-        let result = mcp.handle_post_request(Some(session_id.as_str()), body).await;
+        let result = mcp.handle_post_request(Some(session_id.as_str()), body, None).await;
         let (status, body, _) = read_sse_response(result).await;
 
         assert_eq!(status, 200);
@@ -1084,7 +1163,7 @@ mod tests {
         let session_id = initialize_session(&mcp).await;
 
         let body = br#"{"jsonrpc":"2.0","method":"resources/templates/list","id":8}"#;
-        let result = mcp.handle_post_request(Some(session_id.as_str()), body).await;
+        let result = mcp.handle_post_request(Some(session_id.as_str()), body, None).await;
         let (_, body, _) = read_sse_response(result).await;
 
         assert!(body.contains(r#""resourceTemplates":[]"#));
@@ -1096,10 +1175,97 @@ mod tests {
         let session_id = initialize_session(&mcp).await;
 
         let body = br#"{"jsonrpc":"2.0","method":"resources/subscribe","id":9,"params":{"uri":"res://missing"}}"#;
-        let result = mcp.handle_post_request(Some(session_id.as_str()), body).await;
+        let result = mcp.handle_post_request(Some(session_id.as_str()), body, None).await;
         let (_, body, _) = read_sse_response(result).await;
 
         assert!(body.contains(r#""code":-32002"#));
+    }
+
+    #[tokio::test]
+    async fn delete_reports_the_session_as_gone_exactly_once() {
+        let (mcp, recorder) = middleware_with_recorder();
+        let session_id = initialize_session(&mcp).await;
+
+        assert!(mcp.sessions.delete_session(session_id.as_str()).await);
+        assert_eq!(recorder.disconnected(), vec![session_id.clone()]);
+
+        // The session is gone — a repeated DELETE must not fire again.
+        assert!(!mcp.sessions.delete_session(session_id.as_str()).await);
+        assert_eq!(recorder.disconnected(), vec![session_id]);
+    }
+
+    #[tokio::test]
+    async fn deleting_an_unknown_session_reports_nothing() {
+        let (mcp, recorder) = middleware_with_recorder();
+
+        assert!(!mcp.sessions.delete_session("never-existed").await);
+        assert!(recorder.disconnected().is_empty());
+    }
+
+    #[tokio::test]
+    async fn gc_reports_every_session_it_collects() {
+        let (mcp, recorder) = middleware_with_recorder();
+        let expired = initialize_session(&mcp).await;
+        let fresh = initialize_session(&mcp).await;
+
+        let mut later = DateTimeAsMicroseconds::now();
+        later.add_seconds(3600);
+
+        let removed = mcp
+            .sessions
+            .remove_idle_sessions(later, Duration::from_secs(1800))
+            .await;
+        assert_eq!(removed, 2);
+
+        let mut disconnected = recorder.disconnected();
+        disconnected.sort();
+        let mut expected = vec![expired, fresh];
+        expected.sort();
+        assert_eq!(disconnected, expected);
+
+        // Nothing is left to collect, so a second sweep stays quiet.
+        let removed = mcp
+            .sessions
+            .remove_idle_sessions(later, Duration::from_secs(1800))
+            .await;
+        assert_eq!(removed, 0);
+        assert_eq!(recorder.disconnected().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn lazily_created_session_is_reported_as_gone_too() {
+        let (mcp, recorder) = middleware_with_recorder();
+
+        let body = br#"{"jsonrpc":"2.0","method":"tools/list","id":1}"#;
+        let result = mcp
+            .handle_post_request(Some("client-owned-id"), body, None)
+            .await;
+        let (status, _, _) = read_sse_response(result).await;
+        assert_eq!(status, 200);
+
+        assert!(mcp.sessions.delete_session("client-owned-id").await);
+        assert_eq!(recorder.disconnected(), vec!["client-owned-id".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn session_removal_works_without_a_registered_hook() {
+        let mcp = middleware_with_echo_tool();
+        let session_id = initialize_session(&mcp).await;
+
+        assert!(mcp.sessions.delete_session(session_id.as_str()).await);
+
+        let other = initialize_session(&mcp).await;
+        let mut later = DateTimeAsMicroseconds::now();
+        later.add_seconds(3600);
+        assert_eq!(
+            mcp.sessions
+                .remove_idle_sessions(later, Duration::from_secs(1800))
+                .await,
+            1
+        );
+        assert!(!mcp
+            .sessions
+            .check_session_and_update_last_used(other.as_str(), later));
     }
 
     #[tokio::test]
@@ -1108,7 +1274,7 @@ mod tests {
         let session_id = initialize_session(&mcp).await;
 
         let body = br#"{"jsonrpc":"2.0","method":"tools/list","id":"req-42"}"#;
-        let result = mcp.handle_post_request(Some(session_id.as_str()), body).await;
+        let result = mcp.handle_post_request(Some(session_id.as_str()), body, None).await;
         let (_, body, _) = read_sse_response(result).await;
 
         assert!(body.contains(r#""id":"req-42""#));

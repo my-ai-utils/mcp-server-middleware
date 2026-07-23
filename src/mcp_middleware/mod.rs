@@ -1,3 +1,5 @@
+mod connection_info;
+pub use connection_info::*;
 mod stream_updates;
 pub use stream_updates::*;
 mod sessions;

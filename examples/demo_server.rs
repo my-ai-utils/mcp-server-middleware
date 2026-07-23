@@ -173,6 +173,27 @@ impl Logger for DemoLogger {
     }
 }
 
+/// Prints the two session lifecycle events, so a manual run shows a
+/// session appearing (with the client's IP) and going away on `DELETE`
+/// or after the idle timeout.
+pub struct DemoConnectionInfo;
+
+#[async_trait::async_trait]
+impl McpConnectionInfo for DemoConnectionInfo {
+    async fn on_connected(&self, session: &McpSession, ctx: &mut my_http_server::HttpContext) {
+        println!(
+            "MCP session {} connected from {} (protocol {})",
+            session.id,
+            ctx.request.get_ip().get_real_ip_as_string(),
+            session.version
+        );
+    }
+
+    async fn on_disconnected(&self, session: &McpSession) {
+        println!("MCP session {} disconnected", session.id);
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let mut mcp = McpMiddleware::new(
@@ -185,6 +206,7 @@ async fn main() {
     mcp.register_tool_call(Arc::new(EchoTool));
     mcp.register_prompt(Arc::new(GreetingPrompt));
     mcp.register_resource(Arc::new(StaticGreetingResource));
+    mcp.register_connection_info(Arc::new(DemoConnectionInfo));
 
     let mcp = Arc::new(mcp);
 
