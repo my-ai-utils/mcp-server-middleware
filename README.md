@@ -101,6 +101,7 @@ This middleware (`mcp-server-middleware`) is a **Rust library** that provides a 
 * **Dynamic Enumeration**: Support for dynamically generated enum values based on runtime data
 * **Elicitation** (server→client user input): tools that implement `McpToolCallEx` can request a value from the user mid-execution via `ToolCallContext::elicit()`. Requires the client to advertise `capabilities.elicitation` at initialize. Useful for credentials and confirmations that should never enter the LLM context.
 * **Session lifecycle events**: register an `McpConnectionInfo` hook to be told when a session appears (with the request that created it) and when it is gone — enough to keep a live "who is connected" list in the host.
+* **Error reporting to the host**: every way a request can fail inside the middleware — bad arguments, failed or unknown tools, prompts and resources, unsupported methods, unparsable payloads, session refusals — is written to stderr with a timestamp, and handed to an optional `McpMiddlewareErrorHook` so a host can put it in its own activity console. Each event carries the session id.
 
 ## Installation
 
@@ -1025,6 +1026,14 @@ Installs the host hook for session lifecycle events
 only the first registration is kept. See
 [Tracking live sessions from the host](#tracking-live-sessions-from-the-host).
 
+#### `register_error_hook(hook)`
+
+Installs the host hook for every error the middleware runs into
+(`Arc<dyn McpMiddlewareErrorHook + Send + Sync + 'static>`). Optional,
+and only the first registration is kept. Additional to the stderr line,
+not a replacement for it. See
+[Seeing the errors from the host](#seeing-the-errors-from-the-host).
+
 #### `with_session_idle_timeout(timeout)`
 
 Builder-style override for the session GC idle timeout (default 30
@@ -1070,6 +1079,20 @@ pub trait McpConnectionInfo {
 ```
 
 Register it with `McpMiddleware::register_connection_info()`.
+
+### `McpMiddlewareErrorHook` Trait
+
+Optional host hook for the errors the middleware runs into:
+
+```rust
+#[async_trait::async_trait]
+pub trait McpMiddlewareErrorHook {
+    async fn on_error(&self, err: McpMiddlewareError<'_>);
+}
+```
+
+Register it with `McpMiddleware::register_error_hook()`. See
+[Seeing the errors from the host](#seeing-the-errors-from-the-host).
 
 ### `McpToolCall` Trait
 
@@ -1395,7 +1418,7 @@ The generated schemas are automatically used when clients call `tools/list` to d
 
 ## Error Handling
 
-Tool execution errors should be returned as `Err(String)` from `execute_tool_call`. The middleware reports them **in-band** per the MCP spec — the `tools/call` response carries `isError: true` with the message in `content[0].text` — so the model can see and react to the failure.
+Tool execution errors should be returned as `Err(String)` from `execute_tool_call`. The middleware reports them **in-band** per the MCP spec — the `tools/call` response carries `isError: true` with the message in `content[0].text` — so the model can see and react to the failure. A tool whose `OutputData` can not be serialized is reported the same way, in-band.
 
 Protocol-level problems are reported as JSON-RPC error objects instead:
 
@@ -1404,6 +1427,130 @@ Protocol-level problems are reported as JSON-RPC error objects instead:
 * unknown method → `-32601 Method not found`
 * unparsable request body → HTTP `400` with a `-32700 Parse error` body
 * resource read / prompt execution failure → `-32603 Internal error`
+
+### Arguments that do not match the schema
+
+When `tools/call` arguments fail to deserialize, the tool never runs and
+the refusal carries the tool's own `inputSchema`:
+
+```text
+Can not deserialize input data {"project":"mt-risks","query":"Account groups"}.
+Msg: Error("missing field `pattern`", line: 1, column: 47).
+Expected schema: {"type":"object","properties":{"pattern":{...}},"required":["pattern"]}
+```
+
+A bare `missing field \`pattern\`` is a dead end for a model that
+invented `query` for that field — it has no way of knowing what the
+field should have been without re-reading `tools/list`. With the schema
+in the refusal it corrects itself on the next turn.
+
+### Seeing the errors from the host
+
+Every error above is written to stderr, one line per event, prefixed with
+the timestamp and the name of the component so it is obvious where it
+came from:
+
+```text
+2026-07-25T11:04:18.512331 McpMiddleware error: Tool `search` got arguments that do not match its inputSchema: missing field `pattern` at line 1 column 47. Arguments: {"project":"mt-risks","query":"Account groups"}
+```
+
+That covers `docker logs`, but not an application that keeps its own
+activity console — it used to show a clean history while the client was
+actually being refused. Register an `McpMiddlewareErrorHook` to get the
+same events as data:
+
+```rust
+use mcp_server_middleware::*;
+use my_http_server::async_trait;
+use std::sync::Arc;
+
+pub struct ActivityConsole {
+    log: Arc<ActivityLog>,
+}
+
+#[async_trait::async_trait]
+impl McpMiddlewareErrorHook for ActivityConsole {
+    async fn on_error(&self, err: McpMiddlewareError<'_>) {
+        // The event borrows — copy out only what you keep.
+        match err {
+            McpMiddlewareError::ToolInputDeserialization {
+                session_id, tool_name, arguments, error,
+            } => self.log.push_tool_failed(session_id, tool_name, arguments, error),
+
+            McpMiddlewareError::ToolExecution {
+                session_id, tool_name, error, ..
+            } => self.log.push_tool_failed(session_id, tool_name, "", error),
+
+            // `Display` is a ready-made one-liner for the rest.
+            other => self.log.push_line(other.session_id(), other.to_string()),
+        }
+    }
+}
+
+// ...
+mcp.register_error_hook(Arc::new(ActivityConsole { log }));
+```
+
+The set is meant to be exhaustive — if the middleware refuses a request,
+or something goes wrong while it serves one, it is one of these:
+
+| variant | when |
+|---|---|
+| `ToolInputDeserialization` | `tools/call` arguments did not match the tool's `inputSchema`; the tool never ran |
+| `ToolExecution` | the tool ran and returned `Err` |
+| `ToolNotFound` | `tools/call` named a tool that is not registered |
+| `ToolOutputSerialization` | the tool succeeded but its `OutputData` can not be serialized |
+| `PromptExecution` | a prompt returned `Err` |
+| `PromptNotFound` | `prompts/get` named a prompt that is not registered |
+| `ResourceNotFound` | `resources/read` or `resources/subscribe` named an unknown URI (`method` says which asked) |
+| `ResourceRead` | the resource exists and its `read_resource` returned `Err` |
+| `PayloadDeserialization` | the JSON-RPC envelope, or the `params` of a known method, could not be parsed |
+| `MethodNotFound` | a method this middleware does not implement — including a notification it silently accepts with `202` |
+| `SessionRejected` | `mcp-session-id` missing (`400`) or unknown (`404`), on `POST`, `GET` or `DELETE` |
+| `RequestBodyRead` | the request body could not be read off the socket |
+
+Every variant carries `session_id`; on the three that can fire before a
+session exists — `PayloadDeserialization`, `SessionRejected` and
+`RequestBodyRead` — it is an `Option`. `err.session_id()` gives it to you
+without matching.
+
+Two things are deliberately **not** events:
+
+* **a client going away mid-stream.** A failing SSE write is a disconnect,
+  not an error — it would fire on every closed tab. The middleware drops
+  the session's sender and lets the idle GC collect it; use
+  `McpConnectionInfo::on_disconnected` to see that.
+* **errors a tool returns to itself**, such as a failed
+  `ToolCallContext::elicit`. The tool decides what to do with those; they
+  show up as `ToolExecution` if it propagates them.
+
+Rules of the hook:
+
+* **The hook is additional, not a replacement.** The stderr line above is
+  written either way — registering a hook does not silence it, so a host
+  that renders these events in its own console will see each of them in
+  both places. The console line goes out first, so a slow or broken hook
+  can neither delay nor swallow it.
+* **Nothing on the wire changes.** The error text sent to the client, the
+  JSON-RPC codes and the SSE framing are decided before and
+  independently of the hook. It is a pure observation point and can
+  neither alter nor suppress a response.
+* **It is awaited on the request path, so keep it cheap** — push into a
+  ring buffer, send on an unbounded channel, bump a counter. Anything
+  slow (a network call, a database write) belongs in a task the hook
+  spawns, not in the hook itself.
+* **A panicking hook can not take the request down.** The panic is
+  caught, and the console line has already been written by then.
+* **Arguments that fail to deserialize produce two events**:
+  `ToolInputDeserialization` followed by `ToolExecution`, because the
+  call fails twice on its way out — the executor refuses the arguments
+  and the middleware then sees a failed call. A host that wants one line
+  per call filters on the first.
+* `PayloadDeserialization` is the only event whose `session_id` can be
+  `None` (the request carried no `mcp-session-id` header), and its
+  `method` is empty when the parse failed before the method was known.
+  Its `payload` is the fragment that failed: the `params` object for a
+  per-method failure, the whole request body for an envelope one.
 
 ## Best Practices
 

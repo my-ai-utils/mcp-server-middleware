@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::mcp_middleware::{
-    ElicitationResponse, McpElicitations, McpSessions, McpSocketUpdateEvent,
+    ElicitationResponse, McpElicitations, McpErrorReporter, McpSessions, McpSocketUpdateEvent,
 };
 
 /// Per-call context handed to tools that opt in to context-aware
@@ -14,6 +14,9 @@ pub struct ToolCallContext {
     pub supports_elicitation: bool,
     pub(crate) elicitations: Arc<McpElicitations>,
     pub(crate) sessions: Arc<McpSessions>,
+    /// The host error hook, so the executors can report a tool call that
+    /// never made it past argument deserialization.
+    pub(crate) errors: Arc<McpErrorReporter>,
 }
 
 impl ToolCallContext {

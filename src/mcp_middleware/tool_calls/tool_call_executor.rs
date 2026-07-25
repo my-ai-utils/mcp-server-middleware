@@ -4,7 +4,7 @@ use my_ai_agent::{json_schema::*, my_json};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::mcp_middleware::{
-    ExecutedToolCall, McpToolCallAbstract, McpToolCallExWithInstruction,
+    ExecutedToolCall, McpMiddlewareError, McpToolCallAbstract, McpToolCallExWithInstruction,
     McpToolCallWithInstruction, ToolCallContext,
 };
 use my_http_server::async_trait;
@@ -44,7 +44,7 @@ where
     async fn execute(
         &self,
         input: &str,
-        _ctx: ToolCallContext,
+        ctx: ToolCallContext,
     ) -> Result<ExecutedToolCall, String> {
         let parse_result: Result<InputData, serde_json::Error> = serde_json::from_str(input);
 
@@ -55,17 +55,74 @@ where
                     .await?
             }
             Err(err) => {
-                let msg = format!("Can not deserialize input data {}. Msg: {:?}", input, err);
-                println!("{}", msg);
+                let msg = deserialization_error_message(
+                    input,
+                    &err,
+                    self.get_input_params().await.build(),
+                );
+                let error = err.to_string();
+
+                ctx.errors
+                    .report(McpMiddlewareError::ToolInputDeserialization {
+                        session_id: ctx.session_id.as_str(),
+                        tool_name: self.fn_name,
+                        arguments: input,
+                        error: error.as_str(),
+                    })
+                    .await;
+
                 return Err(msg);
             }
         };
 
+        let structured_json = match serde_json::to_string(&output.data) {
+            Ok(structured_json) => structured_json,
+            Err(err) => {
+                // Used to be an `unwrap()`, which killed the response task
+                // and left the client with an empty stream. It is a bug in
+                // the tool's own output type, so say so in-band instead.
+                let error = err.to_string();
+
+                ctx.errors
+                    .report(McpMiddlewareError::ToolOutputSerialization {
+                        session_id: ctx.session_id.as_str(),
+                        tool_name: self.fn_name,
+                        arguments: input,
+                        error: error.as_str(),
+                    })
+                    .await;
+
+                return Err(format!(
+                    "Can not serialize the result of {}. Msg: {}",
+                    self.fn_name, error
+                ));
+            }
+        };
+
         Ok(ExecutedToolCall {
-            structured_json: serde_json::to_string(&output.data).unwrap(),
+            structured_json,
             instruction: output.instruction,
         })
     }
+}
+
+/// What the client is told when its arguments do not match the tool's
+/// `inputSchema`.
+///
+/// The schema is appended on purpose: a bare `missing field \`pattern\``
+/// is a dead end for the model that invented `query` for that field —
+/// it has no way of knowing what the field should have been without
+/// re-reading `tools/list`. With the schema in the refusal it can
+/// self-correct on the very next turn.
+fn deserialization_error_message(
+    input: &str,
+    err: &serde_json::Error,
+    input_schema: String,
+) -> String {
+    format!(
+        "Can not deserialize input data {}. Msg: {:?}. Expected schema: {}",
+        input, err, input_schema
+    )
 }
 
 /// Context-aware executor — used by [`super::McpMiddleware::register_tool_call_with_context`].
@@ -116,14 +173,52 @@ where
                     .await?
             }
             Err(err) => {
-                let msg = format!("Can not deserialize input data {}. Msg: {:?}", input, err);
-                println!("{}", msg);
+                let msg = deserialization_error_message(
+                    input,
+                    &err,
+                    self.get_input_params().await.build(),
+                );
+                let error = err.to_string();
+
+                ctx.errors
+                    .report(McpMiddlewareError::ToolInputDeserialization {
+                        session_id: ctx.session_id.as_str(),
+                        tool_name: self.fn_name,
+                        arguments: input,
+                        error: error.as_str(),
+                    })
+                    .await;
+
                 return Err(msg);
             }
         };
 
+        let structured_json = match serde_json::to_string(&output.data) {
+            Ok(structured_json) => structured_json,
+            Err(err) => {
+                // Used to be an `unwrap()`, which killed the response task
+                // and left the client with an empty stream. It is a bug in
+                // the tool's own output type, so say so in-band instead.
+                let error = err.to_string();
+
+                ctx.errors
+                    .report(McpMiddlewareError::ToolOutputSerialization {
+                        session_id: ctx.session_id.as_str(),
+                        tool_name: self.fn_name,
+                        arguments: input,
+                        error: error.as_str(),
+                    })
+                    .await;
+
+                return Err(format!(
+                    "Can not serialize the result of {}. Msg: {}",
+                    self.fn_name, error
+                ));
+            }
+        };
+
         Ok(ExecutedToolCall {
-            structured_json: serde_json::to_string(&output.data).unwrap(),
+            structured_json,
             instruction: output.instruction,
         })
     }

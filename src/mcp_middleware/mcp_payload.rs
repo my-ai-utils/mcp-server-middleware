@@ -97,12 +97,61 @@ pub enum McpInputData {
     Other { method: String, data: String },
 }
 
+/// Why a JSON-RPC payload could not be turned into an [`McpInputData`],
+/// split into the pieces the error hook reports.
+///
+/// `message` is the whole complaint and is what the client is told, kept
+/// byte-for-byte identical to what [`McpInputPayload::try_parse`]
+/// returned before this type existed. The other three fields are the
+/// same failure taken apart, so a host does not have to scrape it.
+pub(crate) struct PayloadParseError {
+    /// The method the payload named, when parsing got that far.
+    pub method: Option<String>,
+    /// The fragment that failed: the `params` object for a per-method
+    /// failure, the whole request body for an envelope-level one.
+    pub payload: String,
+    /// Just the reason, without the surrounding "Can not deserialize …".
+    pub error: String,
+    pub message: String,
+}
+
+impl PayloadParseError {
+    /// The `params` of a known method did not deserialize.
+    fn params(method: &str, what: &str, params: &str, err: serde_json::Error) -> Self {
+        Self {
+            method: Some(method.to_string()),
+            payload: params.to_string(),
+            error: err.to_string(),
+            // Byte-for-byte the message this site produced before.
+            message: format!("Can not deserialize {}: {}. Err: {:?}", what, params, err),
+        }
+    }
+
+    /// The JSON-RPC envelope itself is unusable, so there is no method to
+    /// name and the whole body is the payload.
+    fn envelope(body: &[u8], message: String) -> Self {
+        Self {
+            method: None,
+            payload: String::from_utf8_lossy(body).to_string(),
+            error: message.clone(),
+            message,
+        }
+    }
+}
+
 impl McpInputData {
+    /// Kept returning `Result<Self, String>` for callers outside the
+    /// crate; the middleware itself goes through [`Self::parse`] to get
+    /// the failure in pieces.
     pub fn from_str(method: &str, params: String) -> Result<Self, String> {
+        Self::parse(method, params).map_err(|err| err.message)
+    }
+
+    pub(crate) fn parse(method: &str, params: String) -> Result<Self, PayloadParseError> {
         match method {
             "initialize" => {
                 let params = serde_json::from_str(&params).map_err(|err| {
-                    format!("Can not deserialize initialize data: {}. Err: {:?}", params, err)
+                    PayloadParseError::params(method, "initialize data", &params, err)
                 })?;
                 Ok(Self::Initialize(params))
             }
@@ -111,9 +160,11 @@ impl McpInputData {
             "resources/unsubscribe" => {
                 let model: UnsubscribeResourceModel =
                     serde_json::from_str(&params).map_err(|err| {
-                        format!(
-                            "Can not deserialize unsubscribe resource data: {}. Err: {:?}",
-                            params, err
+                        PayloadParseError::params(
+                            method,
+                            "unsubscribe resource data",
+                            &params,
+                            err,
                         )
                     })?;
                 Ok(Self::UnsubscribeResource(model))
@@ -131,20 +182,14 @@ impl McpInputData {
             }
             "resources/read" => {
                 let model: ReadResourceModel = serde_json::from_str(&params).map_err(|err| {
-                    format!(
-                        "Can not deserialize read resource data: {}. Err: {:?}",
-                        params, err
-                    )
+                    PayloadParseError::params(method, "read resource data", &params, err)
                 })?;
                 Ok(Self::ReadResource(model))
             }
             "resources/subscribe" => {
                 let model: SubscribeResourceModel =
                     serde_json::from_str(&params).map_err(|err| {
-                        format!(
-                            "Can not deserialize subscribe resource data: {}. Err: {:?}",
-                            params, err
-                        )
+                        PayloadParseError::params(method, "subscribe resource data", &params, err)
                     })?;
                 Ok(Self::SubscribeResource(model))
             }
@@ -152,10 +197,7 @@ impl McpInputData {
             "prompts/list" => Ok(Self::PromptsList),
             "prompts/get" => {
                 let model: GetPromptModel = serde_json::from_str(&params).map_err(|err| {
-                    format!(
-                        "Can not deserialize get prompt data: {}. Err: {:?}",
-                        params, err
-                    )
+                    PayloadParseError::params(method, "get prompt data", &params, err)
                 })?;
                 Ok(Self::GetPrompt(model))
             }
@@ -163,10 +205,7 @@ impl McpInputData {
             "tools/call" => {
                 let model: ExecuteToolCallModel =
                     serde_json::from_str(&params).map_err(|err| {
-                        format!(
-                            "Can not deserialize tool call data: {}. Err: {:?}",
-                            params, err
-                        )
+                        PayloadParseError::params(method, "tool call data", &params, err)
                     })?;
                 Ok(Self::ExecuteToolCall(model))
             }
@@ -228,6 +267,13 @@ pub struct McpInputPayload {
 
 impl McpInputPayload {
     pub fn try_parse(src: &[u8]) -> Result<Self, String> {
+        Self::parse(src).map_err(|err| err.message)
+    }
+
+    /// Same as [`Self::try_parse`], but keeps the failure in pieces so
+    /// the middleware can report it through
+    /// [`crate::McpMiddlewareErrorHook`] without scraping the message.
+    pub(crate) fn parse(src: &[u8]) -> Result<Self, PayloadParseError> {
         let json_iterator = JsonFirstLineIterator::new(src);
 
         let mut version: Option<String> = None;
@@ -238,9 +284,12 @@ impl McpInputPayload {
         let mut error_json: Option<String> = None;
 
         while let Some(item) = json_iterator.get_next() {
-            let (name, value) = item.map_err(|err| format!("{:?}", err))?;
+            let (name, value) = item
+                .map_err(|err| PayloadParseError::envelope(src, format!("{:?}", err)))?;
 
-            let name = name.as_str().map_err(|err| format!("{:?}", err))?;
+            let name = name
+                .as_str()
+                .map_err(|err| PayloadParseError::envelope(src, format!("{:?}", err)))?;
 
             match name.as_str() {
                 "jsonrpc" => {
@@ -250,7 +299,8 @@ impl McpInputPayload {
                     method = value.as_str().map(|v| v.to_short_string());
                 }
                 "id" => {
-                    id = RequestId::parse(&value)?;
+                    id = RequestId::parse(&value)
+                        .map_err(|err| PayloadParseError::envelope(src, err))?;
                 }
                 "params" => {
                     params = value.as_str().map(|v| v.to_string());
@@ -266,7 +316,10 @@ impl McpInputPayload {
         }
 
         let Some(version) = version else {
-            return Err("Version is null".to_string());
+            return Err(PayloadParseError::envelope(
+                src,
+                "Version is null".to_string(),
+            ));
         };
 
         // JSON-RPC response (no `method`, has `id` and `result`/`error`) →
@@ -284,12 +337,15 @@ impl McpInputPayload {
         }
 
         let Some(method) = method else {
-            return Err("Method is null".to_string());
+            return Err(PayloadParseError::envelope(
+                src,
+                "Method is null".to_string(),
+            ));
         };
 
         let data = match params {
-            Some(params) => McpInputData::from_str(method.as_str(), params)?,
-            None => McpInputData::from_str(method.as_str(), String::new())?,
+            Some(params) => McpInputData::parse(method.as_str(), params)?,
+            None => McpInputData::parse(method.as_str(), String::new())?,
         };
 
         Ok(Self {

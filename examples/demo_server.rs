@@ -4,10 +4,24 @@
 //! Probe:  curl, or `npx @modelcontextprotocol/inspector` pointed at
 //!         http://localhost:8081/mcp
 //!
-//! Exposes one tool (`echo`), one prompt (`greeting`), one static and
-//! one dynamic resource. Every 30 seconds it pushes
+//! Exposes two tools (`echo`, `search`), one prompt (`greeting`), one
+//! static and one dynamic resource. Every 30 seconds it pushes
 //! `notifications/resources/updated` for the dynamic resource so
 //! `resources/subscribe` can be observed end to end.
+//!
+//! It also registers an `McpMiddlewareErrorHook`, which is what a host
+//! with its own activity console does. Call `search` with the wrong
+//! field name to watch it fire:
+//!
+//! ```text
+//! curl -N http://localhost:8081/mcp -H 'mcp-session-id: demo' \
+//!   -H 'content-type: application/json' \
+//!   -d '{"jsonrpc":"2.0","method":"tools/call","id":1,
+//!        "params":{"name":"search","arguments":{"query":"whatever"}}}'
+//! ```
+//!
+//! `search` also fails on purpose for `pattern = "boom"`, so both
+//! `ToolInputDeserialization` and a plain `ToolExecution` can be seen.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -42,6 +56,43 @@ impl McpToolCall<EchoInput, EchoOutput> for EchoTool {
     async fn execute_tool_call(&self, model: EchoInput) -> Result<EchoOutput, String> {
         Ok(EchoOutput {
             echoed: model.text.unwrap_or_else(|| "nothing to echo".to_string()),
+        })
+    }
+}
+
+#[derive(ApplyJsonSchema, Debug, Serialize, Deserialize)]
+pub struct SearchInput {
+    #[property(description = "Pattern to search for")]
+    pub pattern: String,
+    #[property(description = "Project to search in")]
+    pub project: Option<String>,
+}
+
+#[derive(ApplyJsonSchema, Debug, Serialize, Deserialize)]
+pub struct SearchOutput {
+    #[property(description = "What was found")]
+    pub found: String,
+}
+
+/// Deliberately has a *required* field, so a client that gets the field
+/// name wrong is refused before the tool ever runs — the failure the
+/// error hook was added for.
+pub struct SearchTool;
+
+impl ToolDefinition for SearchTool {
+    const FUNC_NAME: &'static str = "search";
+    const DESCRIPTION: &'static str = "Searches for a pattern";
+}
+
+#[async_trait::async_trait]
+impl McpToolCall<SearchInput, SearchOutput> for SearchTool {
+    async fn execute_tool_call(&self, model: SearchInput) -> Result<SearchOutput, String> {
+        if model.pattern == "boom" {
+            return Err("search backend is unavailable".to_string());
+        }
+
+        Ok(SearchOutput {
+            found: format!("nothing matched `{}`", model.pattern),
         })
     }
 }
@@ -194,6 +245,44 @@ impl McpConnectionInfo for DemoConnectionInfo {
     }
 }
 
+/// Stands in for a host's activity console. A real one pushes into a ring
+/// buffer or an unbounded channel — the hook is awaited on the request
+/// path, so it must not block.
+///
+/// Every event the hook sees is also written to stderr by the middleware
+/// itself, so a manual run shows each error twice: once as
+/// `<date> McpMiddleware error: ...`, once as the line below.
+pub struct DemoErrorHook;
+
+#[async_trait::async_trait]
+impl McpMiddlewareErrorHook for DemoErrorHook {
+    async fn on_error(&self, err: McpMiddlewareError<'_>) {
+        // `Display` is a ready-made one-liner; matching on the variants
+        // is what a host that files events by kind would do instead.
+        let kind = match err {
+            McpMiddlewareError::ToolInputDeserialization { .. } => "bad-arguments",
+            McpMiddlewareError::ToolExecution { .. } => "tool-failed",
+            McpMiddlewareError::ToolNotFound { .. } => "unknown-tool",
+            McpMiddlewareError::ToolOutputSerialization { .. } => "bad-tool-output",
+            McpMiddlewareError::PromptExecution { .. } => "prompt-failed",
+            McpMiddlewareError::PromptNotFound { .. } => "unknown-prompt",
+            McpMiddlewareError::ResourceNotFound { .. } => "unknown-resource",
+            McpMiddlewareError::ResourceRead { .. } => "resource-failed",
+            McpMiddlewareError::PayloadDeserialization { .. } => "bad-payload",
+            McpMiddlewareError::MethodNotFound { .. } => "unknown-method",
+            McpMiddlewareError::SessionRejected { .. } => "session-rejected",
+            McpMiddlewareError::RequestBodyRead { .. } => "body-read-failed",
+        };
+
+        println!(
+            "MCP {} [session {}] {}",
+            kind,
+            err.session_id().unwrap_or("-"),
+            err
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let mut mcp = McpMiddleware::new(
@@ -204,9 +293,11 @@ async fn main() {
     );
 
     mcp.register_tool_call(Arc::new(EchoTool));
+    mcp.register_tool_call(Arc::new(SearchTool));
     mcp.register_prompt(Arc::new(GreetingPrompt));
     mcp.register_resource(Arc::new(StaticGreetingResource));
     mcp.register_connection_info(Arc::new(DemoConnectionInfo));
+    mcp.register_error_hook(Arc::new(DemoErrorHook));
 
     let mcp = Arc::new(mcp);
 

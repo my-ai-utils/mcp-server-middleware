@@ -1,5 +1,7 @@
 mod connection_info;
 pub use connection_info::*;
+mod error_hook;
+pub use error_hook::*;
 mod stream_updates;
 pub use stream_updates::*;
 mod sessions;

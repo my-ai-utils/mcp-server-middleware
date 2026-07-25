@@ -145,7 +145,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::mcp_middleware::{McpElicitations, McpSessions, ToolCallContext};
+    use crate::mcp_middleware::{
+        McpElicitations, McpErrorReporter, McpSessions, ToolCallContext,
+    };
 
     struct PlainExTool;
 
@@ -179,6 +181,7 @@ mod tests {
             supports_elicitation: false,
             elicitations: Arc::new(McpElicitations::new()),
             sessions: Arc::new(McpSessions::new()),
+            errors: Arc::new(McpErrorReporter::new()),
         }
     }
 
