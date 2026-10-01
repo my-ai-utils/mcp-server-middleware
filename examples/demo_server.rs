@@ -249,9 +249,11 @@ impl McpConnectionInfo for DemoConnectionInfo {
 /// buffer or an unbounded channel — the hook is awaited on the request
 /// path, so it must not block.
 ///
-/// Every event the hook sees is also written to stderr by the middleware
+/// Every error the hook sees is also written to stderr by the middleware
 /// itself, so a manual run shows each error twice: once as
-/// `<date> McpMiddleware error: ...`, once as the line below.
+/// `<date> McpMiddleware error: ...`, once as the line below. A refused
+/// session is debug info: the middleware writes it as
+/// `<date> McpMiddleware debug: ...`, and only in a debug build.
 pub struct DemoErrorHook;
 
 #[async_trait::async_trait]

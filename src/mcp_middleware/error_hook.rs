@@ -124,6 +124,10 @@ pub enum McpMiddlewareError<'s> {
     /// (`404`). `http_method` is `POST`, `GET` or `DELETE` — a `GET` here
     /// is a client failing to open its SSE stream, a `DELETE` a client
     /// closing a session twice.
+    ///
+    /// This one is debug info rather than an error, see
+    /// [`Self::is_debug_info`]: it is written to the console by a debug
+    /// build only.
     SessionRejected {
         session_id: Option<&'s str>,
         http_method: &'s str,
@@ -157,6 +161,21 @@ impl<'s> McpMiddlewareError<'s> {
             | Self::SessionRejected { session_id, .. }
             | Self::RequestBodyRead { session_id, .. } => *session_id,
         }
+    }
+
+    /// `true` for the events that are routine rather than errors — today
+    /// that is [`Self::SessionRejected`]: a client showing up with a
+    /// session the server no longer has (a restart, the idle GC), or with
+    /// no session at all. In production that happens all the time and is
+    /// fine: the client is answered `404`/`400` and starts over, and
+    /// there is nothing to fix on this side.
+    ///
+    /// The middleware writes these to the console in a debug build only —
+    /// a release build does not have that code at all. The host hook
+    /// still gets them, and can use this to file them apart from the
+    /// real errors or to drop them.
+    pub fn is_debug_info(&self) -> bool {
+        matches!(self, Self::SessionRejected { .. })
     }
 }
 
@@ -265,10 +284,14 @@ impl Display for McpMiddlewareError<'_> {
 /// keeps its own activity log or console — without it these events only
 /// ever reach stderr, where an embedding application can not see them.
 ///
-/// The hook is **additional**, not a replacement: every event goes to
+/// The hook is **additional**, not a replacement: every error goes to
 /// stderr as well, prefixed with the timestamp and `McpMiddleware`, so a
 /// plain `docker logs` still shows it. Registering a hook changes nothing
 /// about that.
+///
+/// The hook sees more than the console does: the events that are
+/// [`McpMiddlewareError::is_debug_info`] reach stderr in a debug build
+/// only, and reach the hook always.
 ///
 /// This is a pure observation hook. It can neither alter nor suppress a
 /// response: the error text sent to the client, the JSON-RPC codes and
@@ -307,20 +330,37 @@ impl McpErrorReporter {
         let _ = self.hook.set(hook);
     }
 
-    /// Reports `err` to both places: stderr always, and the host hook
-    /// when one is registered. The console line goes out first, so a slow
-    /// or broken hook can not delay or swallow it.
+    /// Reports `err` to both places: stderr — always for an error, in a
+    /// debug build only for debug info — and the host hook when one is
+    /// registered. The console line goes out first, so a slow or broken
+    /// hook can not delay or swallow it.
     pub(crate) async fn report(&self, err: McpMiddlewareError<'_>) {
-        eprintln!(
-            "{} McpMiddleware error: {}",
-            DateTimeAsMicroseconds::now().to_rfc3339(),
-            err
-        );
+        write_to_console(&err);
 
         if let Some(hook) = self.hook.get() {
             CatchPanic::new(hook.on_error(err)).await;
         }
     }
+}
+
+fn write_to_console(err: &McpMiddlewareError<'_>) {
+    if !err.is_debug_info() {
+        eprintln!(
+            "{} McpMiddleware error: {}",
+            DateTimeAsMicroseconds::now().to_rfc3339(),
+            err
+        );
+        return;
+    }
+
+    // Debug info is routine in production, so a release build is not
+    // even compiled with the line below.
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "{} McpMiddleware debug: {}",
+        DateTimeAsMicroseconds::now().to_rfc3339(),
+        err
+    );
 }
 
 /// Runs a host hook so a panic inside it can not take the request down.
@@ -402,6 +442,38 @@ mod tests {
             tool_name: "nope",
             arguments: "{}",
         }
+    }
+
+    fn session_rejected() -> McpMiddlewareError<'static> {
+        McpMiddlewareError::SessionRejected {
+            session_id: Some("s1"),
+            http_method: "GET",
+            error: "Unknown MCP session",
+        }
+    }
+
+    /// A refused session is routine, anything else is an error.
+    #[test]
+    fn only_a_rejected_session_is_debug_info() {
+        assert!(session_rejected().is_debug_info());
+        assert!(!error().is_debug_info());
+    }
+
+    /// Keeping debug info off the console must not keep it from the host
+    /// — in a release build the hook is the only place it shows up.
+    #[tokio::test]
+    async fn the_hook_gets_debug_info() {
+        let reporter = McpErrorReporter::new();
+        let recorder = Arc::new(Recorder {
+            seen: parking_lot::Mutex::new(Vec::new()),
+        });
+        reporter.set_hook(recorder.clone());
+
+        reporter.report(session_rejected()).await;
+        assert_eq!(
+            recorder.seen.lock().as_slice(),
+            ["GET request refused: Unknown MCP session"]
+        );
     }
 
     /// With nothing registered the report is still made — to stderr — and

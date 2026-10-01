@@ -101,7 +101,7 @@ This middleware (`mcp-server-middleware`) is a **Rust library** that provides a 
 * **Dynamic Enumeration**: Support for dynamically generated enum values based on runtime data
 * **Elicitation** (server→client user input): tools that implement `McpToolCallEx` can request a value from the user mid-execution via `ToolCallContext::elicit()`. Requires the client to advertise `capabilities.elicitation` at initialize. Useful for credentials and confirmations that should never enter the LLM context.
 * **Session lifecycle events**: register an `McpConnectionInfo` hook to be told when a session appears (with the request that created it) and when it is gone — enough to keep a live "who is connected" list in the host.
-* **Error reporting to the host**: every way a request can fail inside the middleware — bad arguments, failed or unknown tools, prompts and resources, unsupported methods, unparsable payloads, session refusals — is written to stderr with a timestamp, and handed to an optional `McpMiddlewareErrorHook` so a host can put it in its own activity console. Each event carries the session id.
+* **Error reporting to the host**: every way a request can fail inside the middleware — bad arguments, failed or unknown tools, prompts and resources, unsupported methods, unparsable payloads, session refusals — is written to stderr with a timestamp, and handed to an optional `McpMiddlewareErrorHook` so a host can put it in its own activity console. Each event carries the session id. Session refusals are debug info rather than errors: they reach the console in a debug build only.
 
 ## Installation
 
@@ -1454,6 +1454,19 @@ came from:
 2026-07-25T11:04:18.512331 McpMiddleware error: Tool `search` got arguments that do not match its inputSchema: missing field `pattern` at line 1 column 47. Arguments: {"project":"mt-risks","query":"Account groups"}
 ```
 
+One kind of event is **debug info, not an error**, and stays off the
+console in production: `SessionRejected` — a client showing up with a
+session the server no longer has (a restart, the idle GC) or with no
+session at all. That is routine: it happens all the time, the client is
+answered `404`/`400` and starts over, and there is nothing to fix on the
+server side. A debug build writes these lines too, marked as what they
+are; a release build (`cargo build --release`) is compiled without that
+code:
+
+```text
+2026-07-25T11:04:18.512331 McpMiddleware debug: GET request refused: Unknown MCP session
+```
+
 That covers `docker logs`, but not an application that keeps its own
 activity console — it used to show a clean history while the client was
 actually being refused. Register an `McpMiddlewareErrorHook` to get the
@@ -1514,6 +1527,11 @@ session exists — `PayloadDeserialization`, `SessionRejected` and
 `RequestBodyRead` — it is an `Option`. `err.session_id()` gives it to you
 without matching.
 
+`err.is_debug_info()` is `true` for the events the middleware itself
+treats as debug info rather than errors — `SessionRejected` today. The
+hook gets them in a release build as well, so a host that does not want
+them in its activity console filters on it.
+
 Two things are deliberately **not** events:
 
 * **a client going away mid-stream.** A failing SSE write is a disconnect,
@@ -1530,7 +1548,8 @@ Rules of the hook:
   written either way — registering a hook does not silence it, so a host
   that renders these events in its own console will see each of them in
   both places. The console line goes out first, so a slow or broken hook
-  can neither delay nor swallow it.
+  can neither delay nor swallow it. The one asymmetry is debug info: in
+  a release build it reaches the hook and not the console.
 * **Nothing on the wire changes.** The error text sent to the client, the
   JSON-RPC codes and the SSE framing are decided before and
   independently of the hook. It is a pure observation point and can
