@@ -90,12 +90,59 @@ pub fn compile_jsonrpc_error(code: i64, message: &str, id: &RequestId) -> String
     build(json_builder, id)
 }
 
-pub fn compile_resource_templates_list(id: &RequestId) -> String {
+/// Every template on one page - `nextCursor` is never written. Clients that
+/// call this unconditionally (Inspector, Claude) get an empty array when
+/// nothing is registered.
+pub fn compile_resource_templates_list(
+    templates: &[ResourceTemplateExecutor],
+    id: &RequestId,
+) -> String {
     let json_builder = JsonObjectWriter::new().write_json_object("result", |result| {
-        result.write_json_array("resourceTemplates", |arr| arr)
+        result.write_json_array("resourceTemplates", |mut arr| {
+            for template in templates.iter() {
+                arr = arr.write_json_object(|obj| {
+                    let mut obj = obj
+                        .write("uriTemplate", template.uri_template)
+                        .write("name", template.template_name)
+                        .write("description", template.description)
+                        .write("mimeType", template.mime_type);
+
+                    if let Some(title) = template.title.as_deref() {
+                        obj = obj.write("title", title);
+                    }
+
+                    write_icons(obj, &template.icons)
+                });
+            }
+
+            arr
+        })
     });
 
     build(json_builder, id)
+}
+
+fn write_icons(obj: JsonObjectWriter, icons: &[ResourceIcon]) -> JsonObjectWriter {
+    if icons.is_empty() {
+        return obj;
+    }
+
+    obj.write_json_array("icons", |mut icons_arr| {
+        for icon in icons.iter() {
+            icons_arr = icons_arr.write_json_object(|icon_obj| {
+                icon_obj
+                    .write("src", icon.src.as_str())
+                    .write("mimeType", icon.mime_type.as_str())
+                    .write_json_array("sizes", |mut sizes_arr| {
+                        for size in icon.sizes.iter() {
+                            sizes_arr = sizes_arr.write(size.as_str());
+                        }
+                        sizes_arr
+                    })
+            });
+        }
+        icons_arr
+    })
 }
 
 pub fn compile_tool_calls(tools: Vec<ToolCallSchemaData>, id: &RequestId) -> String {
@@ -195,27 +242,7 @@ pub fn compile_resources_list(
                         obj = obj.write("size", size);
                     }
 
-                    let icons = resource.resource.get_icons();
-                    if !icons.is_empty() {
-                        obj = obj.write_json_array("icons", |mut icons_arr| {
-                            for icon in icons.iter() {
-                                icons_arr = icons_arr.write_json_object(|icon_obj| {
-                                    icon_obj
-                                        .write("src", icon.src.as_str())
-                                        .write("mimeType", icon.mime_type.as_str())
-                                        .write_json_array("sizes", |mut sizes_arr| {
-                                            for size in icon.sizes.iter() {
-                                                sizes_arr = sizes_arr.write(size.as_str());
-                                            }
-                                            sizes_arr
-                                        })
-                                });
-                            }
-                            icons_arr
-                        });
-                    }
-
-                    obj
+                    write_icons(obj, &resource.resource.get_icons())
                 });
             }
 
@@ -452,9 +479,75 @@ mod tests {
         assert!(!body.starts_with("data: "));
     }
 
+    struct NeverRead;
+
+    #[my_http_server::async_trait::async_trait]
+    impl McpResourceTemplateService for NeverRead {
+        async fn read_resource(
+            &self,
+            _uri: &str,
+            _variables: &std::collections::HashMap<String, String>,
+        ) -> Result<ResourceReadResult, ResourceTemplateReadError> {
+            unreachable!("listing a template never reads it")
+        }
+    }
+
+    #[test]
+    fn resource_templates_list_carries_every_field() {
+        let templates = vec![
+            ResourceTemplateExecutor {
+                uri_template: "docs://lib/{topic}",
+                template_name: "lib-docs",
+                description: "Docs of the library by topic",
+                mime_type: "text/markdown",
+                title: Some("Library docs".to_string()),
+                icons: vec![ResourceIcon {
+                    src: "https://example.com/icon.png".to_string(),
+                    mime_type: "image/png".to_string(),
+                    sizes: vec!["48x48".to_string()],
+                }],
+                template: UriTemplate::parse("docs://lib/{topic}").unwrap(),
+                holder: std::sync::Arc::new(NeverRead),
+            },
+            ResourceTemplateExecutor {
+                uri_template: "repo://{owner}/{name}",
+                template_name: "repo",
+                description: "A repository",
+                mime_type: "text/plain",
+                title: None,
+                icons: Vec::new(),
+                template: UriTemplate::parse("repo://{owner}/{name}").unwrap(),
+                holder: std::sync::Arc::new(NeverRead),
+            },
+        ];
+
+        let payload = compile_resource_templates_list(&templates, &RequestId::Int(9));
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(strip_sse(&payload)).expect("valid json");
+
+        let result = &parsed["result"];
+        assert!(result.get("nextCursor").is_none());
+
+        let list = result["resourceTemplates"].as_array().unwrap();
+        assert_eq!(list.len(), 2);
+
+        assert_eq!(list[0]["uriTemplate"], "docs://lib/{topic}");
+        assert_eq!(list[0]["name"], "lib-docs");
+        assert_eq!(list[0]["description"], "Docs of the library by topic");
+        assert_eq!(list[0]["mimeType"], "text/markdown");
+        assert_eq!(list[0]["title"], "Library docs");
+        assert_eq!(list[0]["icons"][0]["src"], "https://example.com/icon.png");
+        assert_eq!(list[0]["icons"][0]["sizes"][0], "48x48");
+
+        assert_eq!(list[1]["uriTemplate"], "repo://{owner}/{name}");
+        assert!(list[1].get("title").is_none());
+        assert!(list[1].get("icons").is_none());
+    }
+
     #[test]
     fn resource_templates_list_is_empty_array() {
-        let payload = compile_resource_templates_list(&RequestId::Int(9));
+        let payload = compile_resource_templates_list(&[], &RequestId::Int(9));
 
         let parsed: serde_json::Value =
             serde_json::from_str(strip_sse(&payload)).expect("valid json");

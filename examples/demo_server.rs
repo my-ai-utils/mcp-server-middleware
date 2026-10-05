@@ -5,7 +5,9 @@
 //!         http://localhost:8081/mcp
 //!
 //! Exposes two tools (`echo`, `search`), one prompt (`greeting`), one
-//! static and one dynamic resource. Every 30 seconds it pushes
+//! static and one dynamic resource, and a resource template
+//! (`demo://echo/{text}`: any value reads back as itself, `missing`
+//! answers "resource not found"). Every 30 seconds it pushes
 //! `notifications/resources/updated` for the dynamic resource so
 //! `resources/subscribe` can be observed end to end.
 //!
@@ -168,6 +170,43 @@ impl McpResourceService for DynamicClockResource {
     }
 }
 
+/// Every `demo://echo/{text}` is a resource whose content is the value of
+/// `text`, so a template read can be tried with anything.
+pub struct EchoTemplateResource;
+
+impl ResourceTemplateDefinition for EchoTemplateResource {
+    const URI_TEMPLATE: &'static str = "demo://echo/{text}";
+    const TEMPLATE_NAME: &'static str = "echo";
+    const DESCRIPTION: &'static str = "Reads back whatever stands in place of {text}";
+    const MIME_TYPE: &'static str = "text/plain";
+}
+
+#[async_trait::async_trait]
+impl McpResourceTemplateService for EchoTemplateResource {
+    async fn read_resource(
+        &self,
+        uri: &str,
+        variables: &HashMap<String, String>,
+    ) -> Result<ResourceReadResult, ResourceTemplateReadError> {
+        let text = variables["text"].as_str();
+
+        if text == "missing" {
+            return Err(ResourceTemplateReadError::NotFound(
+                "There is nothing at demo://echo/missing".to_string(),
+            ));
+        }
+
+        Ok(ResourceReadResult {
+            contents: vec![ResourceContent {
+                uri: uri.to_string(),
+                mime_type: Self::MIME_TYPE.to_string(),
+                text: Some(text.to_string()),
+                blob: None,
+            }],
+        })
+    }
+}
+
 pub struct DemoAppStates;
 
 impl ApplicationStates for DemoAppStates {
@@ -291,13 +330,14 @@ async fn main() {
         "/mcp",
         "demo-mcp-server",
         "0.1.0",
-        "Demo MCP server exposing an echo tool, a greeting prompt and two resources",
+        "Demo MCP server exposing an echo tool, a greeting prompt, two resources and a resource template",
     );
 
     mcp.register_tool_call(Arc::new(EchoTool));
     mcp.register_tool_call(Arc::new(SearchTool));
     mcp.register_prompt(Arc::new(GreetingPrompt));
     mcp.register_resource(Arc::new(StaticGreetingResource));
+    mcp.register_resource_template(Arc::new(EchoTemplateResource));
     mcp.register_connection_info(Arc::new(DemoConnectionInfo));
     mcp.register_error_hook(Arc::new(DemoErrorHook));
 

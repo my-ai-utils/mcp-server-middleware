@@ -61,6 +61,7 @@ This middleware (`mcp-server-middleware`) is a **Rust library** that provides a 
 - `PromptDefinition`: Trait for providing prompt metadata
 - `ResourceDefinition` & `McpResourceService`: Traits for resource management (static, compile-time URIs)
 - Dynamic resource registry: register/unregister resources with runtime URIs after the middleware is mounted
+- `ResourceTemplateDefinition` & `McpResourceTemplateService`: Traits for resource templates — one handler serves every URI of one shape (`docs://lib/{topic}`)
 
 **Type Safety**:
 - Automatic JSON schema generation from Rust types using `ApplyJsonSchema` macro
@@ -87,6 +88,7 @@ This middleware (`mcp-server-middleware`) is a **Rust library** that provides a 
 - Streaming support - real-time updates via SSE
 - Resource pagination - efficient handling of large resource lists
 - Dynamic resources - register/unregister resources at runtime (e.g. one per uploaded file or generated artifact), served as `blob` (base64) or `text`
+- Resource templates - parameterized URIs (`docs://lib/{topic}`) listed in `resources/templates/list` and read through one handler that gets the variables
 - Prompt templates - reusable prompts with variable substitution
 
 ## Features
@@ -396,6 +398,87 @@ Notes:
 - Returning `blob` (base64) with an image MIME type lets MCP clients
   render the resource as an image content block — the right channel for
   binary payloads, instead of stuffing base64 into tool-call JSON.
+
+### 5c. Register Resource Templates
+
+A resource template is a family of resources whose URIs share one shape,
+served by one handler: `docs://lib/{topic}` instead of one resource per
+topic. Templates are listed in `resources/templates/list`, and
+`resources/read` of a concrete URI (`docs://lib/events-loop`) reaches the
+handler together with the variables (`topic` → `events-loop`).
+
+```rust
+use std::collections::HashMap;
+use mcp_server_middleware::{
+    McpResourceTemplateService, ResourceContent, ResourceReadResult, ResourceTemplateDefinition,
+    ResourceTemplateReadError,
+};
+use async_trait::async_trait;
+
+pub struct LibDocs;
+
+impl ResourceTemplateDefinition for LibDocs {
+    const URI_TEMPLATE: &'static str = "docs://lib/{topic}";
+    const TEMPLATE_NAME: &'static str = "lib-docs";
+    const DESCRIPTION: &'static str = "Library documentation, one topic per resource";
+    const MIME_TYPE: &'static str = "text/markdown";
+}
+
+#[async_trait]
+impl McpResourceTemplateService for LibDocs {
+    async fn read_resource(
+        &self,
+        uri: &str,
+        variables: &HashMap<String, String>,
+    ) -> Result<ResourceReadResult, ResourceTemplateReadError> {
+        let topic = variables["topic"].as_str();
+
+        let Some(text) = load_topic(topic) else {
+            // Answered as `-32002 Resource not found` with this message.
+            return Err(ResourceTemplateReadError::NotFound(format!(
+                "Unknown topic `{}`. Available: events-loop, timers",
+                topic
+            )));
+        };
+
+        Ok(ResourceReadResult {
+            contents: vec![ResourceContent {
+                uri: uri.to_string(), // the concrete URI, not the template
+                mime_type: Self::MIME_TYPE.to_string(),
+                text: Some(text),
+                blob: None,
+            }],
+        })
+    }
+}
+
+mcp_middleware.register_resource_template(Arc::new(LibDocs));
+```
+
+Rules:
+- Only RFC 6570 level 1: literal text plus simple `{name}` variables.
+  Operators (`{+path}`, `{?query}`, ...), modifiers (`{list*}`,
+  `{name:3}`) and two variables with no literal text between them make
+  `register_resource_template` panic.
+- A variable is one non-empty piece of a path segment: its raw value never
+  contains `/`, `?` or `#`. The handler gets it percent-decoded. A value
+  that decodes to something with a `/`, or to `.` / `..`, is not a match,
+  so a variable can not be used to walk to another path. The handler still
+  checks the value against what it actually serves.
+- `resources/read` looks for the exact URI among the static resources,
+  then the dynamic ones, and only then among the templates. Of several
+  matching templates the one with the most literal text wins
+  (`docs://lib/{topic}.md` over `docs://lib/{topic}`); on a tie, the one
+  registered first.
+- `ResourceTemplateReadError::NotFound(message)` is answered as `-32002
+  Resource not found` with `message`, which is a good place to list what
+  does exist. `Internal(message)` — also what a `String` error becomes
+  through `?` — is answered as `-32603`. A URI that no template matches is
+  `-32002 Resource not found: <uri>`, as before.
+- `resources/subscribe` accepts any URI a template matches; the handler is
+  not asked.
+- Templates are not part of `resources/list`. `resources/templates/list`
+  returns all of them on one page.
 
 ### 6. Integrate with HTTP Server
 
@@ -967,6 +1050,17 @@ service must implement `ResourceDefinition` (provides `RESOURCE_URI`,
 `get_title` / `get_size` / `get_icons`) and `McpResourceService`
 (provides `read_resource`).
 
+#### `register_resource_template(service)`
+
+Registers a resource template — one handler for every URI that matches
+a `{name}` template. The service must implement
+`ResourceTemplateDefinition` (provides `URI_TEMPLATE`, `TEMPLATE_NAME`,
+`DESCRIPTION`, `MIME_TYPE` consts plus optional `get_title` /
+`get_icons`) and `McpResourceTemplateService` (provides
+`read_resource(uri, variables)`). Panics on a template that is not
+RFC 6570 level 1; registering the same template twice replaces the
+previous entry. See "5c. Register Resource Templates".
+
 #### `register_dynamic_resource(uri, name, description, mime_type, service)` *(async)*
 
 Registers a resource minted at runtime. URI is a `String` chosen by the
@@ -1260,11 +1354,12 @@ The middleware implements the MCP Streamable HTTP transport (protocol revisions 
 * **`resources/read`**: Reads resource contents
   - Returns text or binary content based on resource type
   - Supports multiple content blocks per resource
+  - Looks for the exact URI among the static, then the dynamic resources, and falls back to the resource templates
 
-* **`resources/templates/list`**: Returns an empty `resourceTemplates` list (URI templates are not supported, but clients that call this unconditionally get a valid response)
+* **`resources/templates/list`**: Returns the registered resource templates (`uriTemplate`, `name`, `description`, `mimeType`, optional `title` / `icons`), all on one page; an empty list when none are registered
 
 * **`resources/subscribe`** / **`resources/unsubscribe`**: Per-session subscriptions to resource changes
-  - Subscribe validates the URI (unknown URI → `-32002 Resource not found`) and answers with an empty result, per spec
+  - Subscribe validates the URI (a static or dynamic resource, or a URI a template matches; anything else → `-32002 Resource not found`) and answers with an empty result, per spec
   - Push updates to subscribers from your code via `McpMiddleware::notify_resource_updated(uri)` — subscribed sessions with a live SSE stream receive `notifications/resources/updated`
 
 * **`ping`**: Health check endpoint for connection testing

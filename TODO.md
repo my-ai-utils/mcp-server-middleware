@@ -20,7 +20,7 @@
 ## Tools / Prompts / Resources API
 
 - [ ] **`tools/list_changed` авто** — сейчас фан-аут только если потребитель явно зовёт `notify_tools_changed()`. Опционально: триггерить из `register_tool_call` после `initialize` (если регистрация рантайм-динамическая).
-- [ ] **Resource templates (`resources/templates/list`)** — параметризованные URI типа `file:///{path}`. Не реализовано, типов нет.
+- [x] **Resource templates (`resources/templates/list`)** — реализованы в 0.10.0: `ResourceTemplateDefinition` + `McpResourceTemplateService`, регистрация через `register_resource_template`. Поддержан только RFC 6570 level 1 (`{name}`), одна переменная — часть одного сегмента пути; операторы и модификаторы отклоняются при регистрации. Автодополнение аргументов шаблона — отдельный пункт `completion/complete`.
 - [ ] **Tool annotations** — `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`. Должны попадать в `tools/list`. Сейчас `ToolDefinition` их не выставляет.
 - [ ] **Tool `_meta` и `title`** — отдельный человекочитаемый title, помимо `name`/`description`.
 - [ ] **Prompts с image/audio/embedded resource контентом** — сейчас `PromptExecutionResult.message: String`. Спека разрешает массив content-блоков разных типов.

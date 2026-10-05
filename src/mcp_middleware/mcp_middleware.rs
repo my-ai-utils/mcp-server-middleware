@@ -9,10 +9,12 @@ use serde::{Serialize, de::DeserializeOwned};
 use crate::mcp_middleware::{
     DynamicResourceExecutor, DynamicResources, InitializeMpcContract, McpConnectionInfo,
     McpElicitations, McpErrorReporter, McpInputData, McpInputPayload, McpMiddlewareError,
-    McpMiddlewareErrorHook, McpPromptService, McpPrompts, McpResourceService, McpResources,
-    McpSessions, McpToolCallExWithInstruction, McpToolCallWithInstruction, McpToolCalls,
-    PromptDefinition, PromptExecutor, RequestId, ResourceDefinition, ResourceExecutor,
-    ResourceIcon, SESSION_HEADER, ToolCallContext, ToolCallExecutor, ToolCallExecutorEx,
+    McpMiddlewareErrorHook, McpPromptService, McpPrompts, McpResourceService,
+    McpResourceTemplateService, McpResourceTemplates, McpResources, McpSessions,
+    McpToolCallExWithInstruction, McpToolCallWithInstruction, McpToolCalls, PromptDefinition,
+    PromptExecutor, RequestId, ResourceDefinition, ResourceExecutor, ResourceIcon,
+    ResourceTemplateDefinition, ResourceTemplateExecutor, ResourceTemplateReadError,
+    SESSION_HEADER, ToolCallContext, ToolCallExecutor, ToolCallExecutorEx, UriTemplate,
     parse_elicitation_response,
 };
 
@@ -27,6 +29,9 @@ pub struct McpMiddleware {
     tool_calls: McpToolCalls,
     prompts: McpPrompts,
     resources: McpResources,
+    /// URI templates (`docs://lib/{topic}`): one handler serves every URI
+    /// that matches. Consulted after the static and the dynamic registries.
+    resource_templates: McpResourceTemplates,
     /// Runtime-registered resources. Static resources go through
     /// `resources`; this registry serves URIs minted after `new()`
     /// (e.g. one resource per downloaded Telegram media item).
@@ -74,6 +79,7 @@ impl McpMiddleware {
             tool_calls: McpToolCalls::new(),
             prompts: McpPrompts::new(),
             resources: McpResources::new(),
+            resource_templates: McpResourceTemplates::new(),
             dynamic_resources: Arc::new(tokio::sync::RwLock::new(DynamicResources::new())),
             elicitations: Arc::new(McpElicitations::new()),
             errors: Arc::new(McpErrorReporter::new()),
@@ -255,6 +261,48 @@ impl McpMiddleware {
         self.resources.add(Arc::new(executor));
     }
 
+    /// Registers a resource template: every URI that matches its
+    /// `URI_TEMPLATE` is read through the one service, which gets the
+    /// template's variables. Listed in `resources/templates/list`;
+    /// `resources/read` falls back to the templates when neither a static
+    /// nor a dynamic resource has the exact URI.
+    ///
+    /// Panics when `URI_TEMPLATE` is not a level-1 template - see
+    /// [`ResourceTemplateDefinition::URI_TEMPLATE`]. Registering the same
+    /// template twice replaces the previous entry.
+    pub fn register_resource_template<
+        TMcpResourceTemplateService: McpResourceTemplateService
+            + Send
+            + Sync
+            + 'static
+            + ResourceTemplateDefinition,
+    >(
+        &mut self,
+        service: Arc<TMcpResourceTemplateService>,
+    ) {
+        let uri_template = TMcpResourceTemplateService::URI_TEMPLATE;
+
+        let template = UriTemplate::parse(uri_template).unwrap_or_else(|err| {
+            panic!(
+                "Resource template `{}` is not supported: {}",
+                uri_template, err
+            )
+        });
+
+        let executor = ResourceTemplateExecutor {
+            uri_template,
+            template_name: TMcpResourceTemplateService::TEMPLATE_NAME,
+            description: TMcpResourceTemplateService::DESCRIPTION,
+            mime_type: TMcpResourceTemplateService::MIME_TYPE,
+            title: service.get_title().map(|s| s.to_string()),
+            icons: service.get_icons(),
+            template,
+            holder: service,
+        };
+
+        self.resource_templates.add(executor);
+    }
+
     /// Register a resource minted at runtime. URI is whatever caller
     /// chooses (commonly `scheme://path/{id}`). Idempotent: registering
     /// the same URI twice overwrites the previous entry. Use
@@ -388,9 +436,10 @@ impl McpMiddleware {
             }
 
             super::McpInputData::ResourceTemplatesList => {
-                // No URI-template support — an empty list keeps clients
-                // that call this unconditionally (Inspector, Claude) happy.
-                let response = super::mcp_output_contract::compile_resource_templates_list(id);
+                let response = super::mcp_output_contract::compile_resource_templates_list(
+                    self.resource_templates.get_list(),
+                    id,
+                );
                 return send_response_as_stream(response, session_id, now);
             }
 
@@ -400,21 +449,10 @@ impl McpMiddleware {
                 } else {
                     let guard = self.dynamic_resources.read().await;
                     if !guard.contains(&params.uri) {
-                        self.errors
-                            .report(McpMiddlewareError::ResourceNotFound {
-                                session_id,
-                                method: "resources/read",
-                                uri: params.uri.as_str(),
-                            })
+                        drop(guard);
+                        return self
+                            .read_templated_resource(session_id, params.uri.as_str(), now, id)
                             .await;
-
-                        return send_jsonrpc_error_as_stream(
-                            super::mcp_output_contract::JSONRPC_RESOURCE_NOT_FOUND,
-                            format!("Resource not found: {}", params.uri).as_str(),
-                            id,
-                            session_id,
-                            now,
-                        );
                     }
                     guard.read(&params.uri).await
                 };
@@ -447,8 +485,11 @@ impl McpMiddleware {
             }
 
             super::McpInputData::SubscribeResource(params) => {
+                // A templated URI is accepted by its shape alone - the
+                // template's handler is not asked whether it exists.
                 let known = self.resources.get(&params.uri).is_some()
-                    || self.dynamic_resources.read().await.contains(&params.uri);
+                    || self.dynamic_resources.read().await.contains(&params.uri)
+                    || self.resource_templates.find(&params.uri).is_some();
 
                 if !known {
                     self.errors
@@ -716,6 +757,66 @@ impl McpMiddleware {
                     session_id,
                     now,
                 );
+            }
+        }
+    }
+
+    /// `resources/read` of a URI that is neither a static nor a dynamic
+    /// resource: the last chance is a template that matches it.
+    async fn read_templated_resource(
+        &self,
+        session_id: &str,
+        uri: &str,
+        now: DateTimeAsMicroseconds,
+        id: &RequestId,
+    ) -> Result<HttpOkResult, HttpFailResult> {
+        let read_result = match self.resource_templates.find(uri) {
+            Some((template, variables)) => template.holder.read_resource(uri, &variables).await,
+            None => Err(ResourceTemplateReadError::NotFound(format!(
+                "Resource not found: {}",
+                uri
+            ))),
+        };
+
+        match read_result {
+            Ok(response) => {
+                let response =
+                    super::mcp_output_contract::compile_read_resource_response(response, id);
+                send_response_as_stream(response, session_id, now)
+            }
+            Err(ResourceTemplateReadError::NotFound(message)) => {
+                self.errors
+                    .report(McpMiddlewareError::ResourceNotFound {
+                        session_id,
+                        method: "resources/read",
+                        uri,
+                    })
+                    .await;
+
+                send_jsonrpc_error_as_stream(
+                    super::mcp_output_contract::JSONRPC_RESOURCE_NOT_FOUND,
+                    message.as_str(),
+                    id,
+                    session_id,
+                    now,
+                )
+            }
+            Err(ResourceTemplateReadError::Internal(error)) => {
+                self.errors
+                    .report(McpMiddlewareError::ResourceRead {
+                        session_id,
+                        uri,
+                        error: error.as_str(),
+                    })
+                    .await;
+
+                send_jsonrpc_error_as_stream(
+                    super::mcp_output_contract::JSONRPC_INTERNAL_ERROR,
+                    error.as_str(),
+                    id,
+                    session_id,
+                    now,
+                )
             }
         }
     }
@@ -1208,6 +1309,94 @@ mod tests {
         }
     }
 
+    fn text_resource(uri: &str, text: String) -> crate::ResourceReadResult {
+        crate::ResourceReadResult {
+            contents: vec![crate::ResourceContent {
+                uri: uri.to_string(),
+                mime_type: "text/markdown".to_string(),
+                text: Some(text),
+                blob: None,
+            }],
+        }
+    }
+
+    /// Serves `docs://lib/{topic}`: knows two topics, fails on `broken`
+    /// and answers `NotFound` for everything else.
+    struct DocsTemplate;
+
+    impl ResourceTemplateDefinition for DocsTemplate {
+        const URI_TEMPLATE: &'static str = "docs://lib/{topic}";
+        const TEMPLATE_NAME: &'static str = "lib-docs";
+        const DESCRIPTION: &'static str = "Library docs by topic";
+        const MIME_TYPE: &'static str = "text/markdown";
+    }
+
+    #[async_trait::async_trait]
+    impl McpResourceTemplateService for DocsTemplate {
+        async fn read_resource(
+            &self,
+            uri: &str,
+            variables: &std::collections::HashMap<String, String>,
+        ) -> Result<crate::ResourceReadResult, ResourceTemplateReadError> {
+            let topic = variables.get("topic").expect("the template has `topic`");
+
+            match topic.as_str() {
+                "broken" => Err(ResourceTemplateReadError::Internal(
+                    "disk is on fire".to_string(),
+                )),
+                "events-loop" | "hello world" => {
+                    Ok(text_resource(uri, format!("topic: {}", topic)))
+                }
+                _ => Err(ResourceTemplateReadError::NotFound(format!(
+                    "Unknown topic `{}`. Available: events-loop",
+                    topic
+                ))),
+            }
+        }
+    }
+
+    /// Has more literal text than `DocsTemplate`, so `docs://lib/<x>.md`
+    /// belongs to it although both templates match.
+    struct MarkdownDocsTemplate;
+
+    impl ResourceTemplateDefinition for MarkdownDocsTemplate {
+        const URI_TEMPLATE: &'static str = "docs://lib/{topic}.md";
+        const TEMPLATE_NAME: &'static str = "lib-docs-md";
+        const DESCRIPTION: &'static str = "Library docs by topic, as a file";
+        const MIME_TYPE: &'static str = "text/markdown";
+    }
+
+    #[async_trait::async_trait]
+    impl McpResourceTemplateService for MarkdownDocsTemplate {
+        async fn read_resource(
+            &self,
+            uri: &str,
+            variables: &std::collections::HashMap<String, String>,
+        ) -> Result<crate::ResourceReadResult, ResourceTemplateReadError> {
+            Ok(text_resource(
+                uri,
+                format!("markdown: {}", variables["topic"]),
+            ))
+        }
+    }
+
+    /// A static resource whose URI fits `DocsTemplate` as well.
+    struct PinnedDoc;
+
+    impl ResourceDefinition for PinnedDoc {
+        const RESOURCE_URI: &'static str = "docs://lib/pinned";
+        const RESOURCE_NAME: &'static str = "pinned";
+        const DESCRIPTION: &'static str = "A doc with its own static resource";
+        const MIME_TYPE: &'static str = "text/markdown";
+    }
+
+    #[async_trait::async_trait]
+    impl McpResourceService for PinnedDoc {
+        async fn read_resource(&self) -> Result<crate::ResourceReadResult, String> {
+            Ok(text_resource(Self::RESOURCE_URI, "pinned".to_string()))
+        }
+    }
+
     fn middleware_with_echo_tool() -> McpMiddleware {
         let mut mcp = McpMiddleware::new("/mcp", "test-server", "0.0.1", "test instructions");
         mcp.register_tool_call(Arc::new(EchoTool));
@@ -1417,6 +1606,14 @@ mod tests {
         let hook = Arc::new(RecordingErrorHook::default());
         let mut mcp = middleware_with_echo_tool();
         mcp.register_error_hook(hook.clone());
+        (mcp, hook)
+    }
+
+    fn middleware_with_templates() -> (McpMiddleware, Arc<RecordingErrorHook>) {
+        let (mut mcp, hook) = middleware_with_error_hook();
+        mcp.register_resource_template(Arc::new(DocsTemplate));
+        mcp.register_resource_template(Arc::new(MarkdownDocsTemplate));
+        mcp.register_resource(Arc::new(PinnedDoc));
         (mcp, hook)
     }
 
@@ -1677,6 +1874,228 @@ mod tests {
         let (_, body, _) = read_sse_response(result).await;
 
         assert!(body.contains(r#""code":-32002"#));
+    }
+
+    /// The JSON-RPC message of a one-frame SSE response.
+    fn sse_json(body: &str) -> serde_json::Value {
+        let json = body
+            .strip_prefix("data: ")
+            .expect("an SSE data frame")
+            .trim_end();
+        serde_json::from_str(json).expect("valid json")
+    }
+
+    async fn post(mcp: &McpMiddleware, session_id: &str, body: String) -> serde_json::Value {
+        let result = mcp
+            .handle_post_request(Some(session_id), body.as_bytes(), None)
+            .await;
+        let (_, body, _) = read_sse_response(result).await;
+        sse_json(&body)
+    }
+
+    async fn read_resource(mcp: &McpMiddleware, session_id: &str, uri: &str) -> serde_json::Value {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","method":"resources/read","id":5,"params":{{"uri":"{}"}}}}"#,
+            uri
+        );
+        post(mcp, session_id, body).await
+    }
+
+    #[tokio::test]
+    async fn resource_templates_list_returns_the_registered_templates() {
+        let (mcp, _) = middleware_with_templates();
+        let session_id = initialize_session(&mcp).await;
+
+        let body = r#"{"jsonrpc":"2.0","method":"resources/templates/list","id":8}"#;
+        let parsed = post(&mcp, session_id.as_str(), body.to_string()).await;
+
+        let templates = parsed["result"]["resourceTemplates"].as_array().unwrap();
+        assert_eq!(templates.len(), 2);
+        assert_eq!(templates[0]["uriTemplate"], "docs://lib/{topic}");
+        assert_eq!(templates[0]["name"], "lib-docs");
+        assert_eq!(templates[0]["description"], "Library docs by topic");
+        assert_eq!(templates[0]["mimeType"], "text/markdown");
+        assert_eq!(templates[1]["uriTemplate"], "docs://lib/{topic}.md");
+    }
+
+    #[tokio::test]
+    async fn templates_are_not_listed_as_resources() {
+        let (mcp, _) = middleware_with_templates();
+        let session_id = initialize_session(&mcp).await;
+
+        let body = r#"{"jsonrpc":"2.0","method":"resources/list","id":8}"#;
+        let parsed = post(&mcp, session_id.as_str(), body.to_string()).await;
+
+        let uris: Vec<&str> = parsed["result"]["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|resource| resource["uri"].as_str().unwrap())
+            .collect();
+        assert_eq!(uris, vec!["docs://lib/pinned", "test://failing"]);
+    }
+
+    #[tokio::test]
+    async fn reading_a_templated_uri_hands_the_variables_to_the_handler() {
+        let (mcp, hook) = middleware_with_templates();
+        let session_id = initialize_session(&mcp).await;
+
+        let parsed = read_resource(&mcp, session_id.as_str(), "docs://lib/events-loop").await;
+
+        let content = &parsed["result"]["contents"][0];
+        assert_eq!(content["uri"], "docs://lib/events-loop");
+        assert_eq!(content["text"], "topic: events-loop");
+        assert!(hook.errors().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_percent_encoded_variable_reaches_the_handler_decoded() {
+        let (mcp, _) = middleware_with_templates();
+        let session_id = initialize_session(&mcp).await;
+
+        let parsed = read_resource(&mcp, session_id.as_str(), "docs://lib/hello%20world").await;
+
+        let content = &parsed["result"]["contents"][0];
+        assert_eq!(content["uri"], "docs://lib/hello%20world");
+        assert_eq!(content["text"], "topic: hello world");
+    }
+
+    #[tokio::test]
+    async fn the_template_with_more_literal_text_wins() {
+        let (mcp, _) = middleware_with_templates();
+        let session_id = initialize_session(&mcp).await;
+
+        let parsed = read_resource(&mcp, session_id.as_str(), "docs://lib/intro.md").await;
+
+        assert_eq!(parsed["result"]["contents"][0]["text"], "markdown: intro");
+    }
+
+    #[tokio::test]
+    async fn an_exact_static_uri_wins_over_a_template() {
+        let (mcp, _) = middleware_with_templates();
+        let session_id = initialize_session(&mcp).await;
+
+        let parsed = read_resource(&mcp, session_id.as_str(), "docs://lib/pinned").await;
+
+        assert_eq!(parsed["result"]["contents"][0]["text"], "pinned");
+    }
+
+    #[tokio::test]
+    async fn a_uri_no_template_matches_is_resource_not_found() {
+        let (mcp, hook) = middleware_with_templates();
+        let session_id = initialize_session(&mcp).await;
+
+        for uri in [
+            "docs://lib/a/b",
+            "docs://lib/a%2Fb",
+            "docs://lib/..",
+            "docs://other/events-loop",
+        ] {
+            let parsed = read_resource(&mcp, session_id.as_str(), uri).await;
+
+            assert_eq!(parsed["error"]["code"], -32002, "{}", uri);
+            assert_eq!(
+                parsed["error"]["message"],
+                format!("Resource not found: {}", uri)
+            );
+            assert_eq!(
+                hook.errors().pop().unwrap(),
+                Recorded::ResourceNotFound {
+                    session_id: session_id.clone(),
+                    method: "resources/read".to_string(),
+                    uri: uri.to_string(),
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn not_found_from_the_handler_is_resource_not_found_with_its_message() {
+        let (mcp, hook) = middleware_with_templates();
+        let session_id = initialize_session(&mcp).await;
+
+        let parsed = read_resource(&mcp, session_id.as_str(), "docs://lib/nope").await;
+
+        assert_eq!(parsed["error"]["code"], -32002);
+        assert_eq!(
+            parsed["error"]["message"],
+            "Unknown topic `nope`. Available: events-loop"
+        );
+        assert_eq!(
+            hook.errors(),
+            vec![Recorded::ResourceNotFound {
+                session_id,
+                method: "resources/read".to_string(),
+                uri: "docs://lib/nope".to_string(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_internal_error_from_the_handler_is_an_internal_error() {
+        let (mcp, hook) = middleware_with_templates();
+        let session_id = initialize_session(&mcp).await;
+
+        let parsed = read_resource(&mcp, session_id.as_str(), "docs://lib/broken").await;
+
+        assert_eq!(parsed["error"]["code"], -32603);
+        assert_eq!(parsed["error"]["message"], "disk is on fire");
+        assert_eq!(
+            hook.errors(),
+            vec![Recorded::ResourceRead {
+                session_id,
+                uri: "docs://lib/broken".to_string(),
+                error: "disk is on fire".to_string(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_accepts_a_uri_a_template_matches() {
+        let (mcp, hook) = middleware_with_templates();
+        let session_id = initialize_session(&mcp).await;
+
+        let subscribe = |uri: &str| {
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"resources/subscribe","id":9,"params":{{"uri":"{}"}}}}"#,
+                uri
+            )
+        };
+
+        let parsed = post(&mcp, session_id.as_str(), subscribe("docs://lib/anything")).await;
+        assert!(parsed.get("error").is_none());
+        assert!(parsed["result"].is_object());
+        assert!(hook.errors().is_empty());
+
+        let parsed = post(&mcp, session_id.as_str(), subscribe("docs://lib/a/b")).await;
+        assert_eq!(parsed["error"]["code"], -32002);
+    }
+
+    #[test]
+    #[should_panic(expected = "Resource template `docs://{+path}` is not supported")]
+    fn registering_a_template_with_an_operator_panics() {
+        struct PathTemplate;
+
+        impl ResourceTemplateDefinition for PathTemplate {
+            const URI_TEMPLATE: &'static str = "docs://{+path}";
+            const TEMPLATE_NAME: &'static str = "path";
+            const DESCRIPTION: &'static str = "Reserved expansion is level 2";
+            const MIME_TYPE: &'static str = "text/plain";
+        }
+
+        #[async_trait::async_trait]
+        impl McpResourceTemplateService for PathTemplate {
+            async fn read_resource(
+                &self,
+                _uri: &str,
+                _variables: &std::collections::HashMap<String, String>,
+            ) -> Result<crate::ResourceReadResult, ResourceTemplateReadError> {
+                unreachable!("never registered")
+            }
+        }
+
+        let mut mcp = McpMiddleware::new("/mcp", "test-server", "0.0.1", "test instructions");
+        mcp.register_resource_template(Arc::new(PathTemplate));
     }
 
     #[tokio::test]

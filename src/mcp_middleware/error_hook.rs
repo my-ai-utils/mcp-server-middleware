@@ -80,14 +80,17 @@ pub enum McpMiddlewareError<'s> {
         arguments: &'s HashMap<String, String>,
     },
     /// `resources/read` or `resources/subscribe` named a URI that is
-    /// neither a static nor a dynamic resource. `method` says which of
-    /// the two asked.
+    /// neither a static nor a dynamic resource and that no resource
+    /// template matches - or a template matched and its handler answered
+    /// [`crate::ResourceTemplateReadError::NotFound`]. `method` says which
+    /// of the two asked.
     ResourceNotFound {
         session_id: &'s str,
         method: &'s str,
         uri: &'s str,
     },
-    /// The resource exists and its `read_resource` returned `Err`.
+    /// The resource exists and its `read_resource` returned `Err` - for a
+    /// templated resource, [`crate::ResourceTemplateReadError::Internal`].
     ResourceRead {
         session_id: &'s str,
         uri: &'s str,
