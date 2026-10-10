@@ -3,6 +3,9 @@ name = "mcp-server-middleware"
 version = "0.9.0"
 edition = "2024"
 
+[workspace]
+members = [".", "mcp-server-middleware-macros"]
+
 [dependencies]
 tokio = { version = "*", features = ["full"] }
 
@@ -16,9 +19,8 @@ serde_json = "1.0"
 parking_lot = "0.12"
 
 
-my-ai-agent = { tag = "0.1.0", git = "https://github.com/my-ai-utils/my-ai-agent.git", features = [
-    "agent",
-] }
+json-schema = { tag = "0.1.0", git = "https://github.com/my-jet-tools/json-schema.git" }
+mcp-server-middleware-macros = { path = "mcp-server-middleware-macros" }
 
 [dev-dependencies]
 # Collecting SSE bodies from HttpOutput::Raw responses in tests.

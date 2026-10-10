@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use my_ai_agent::my_json::json_writer::{JsonObjectWriter, RawJsonObject};
+use json_schema::my_json::json_writer::{JsonObjectWriter, RawJsonObject};
 use my_http_server::HttpOutputProducer;
 
 /// Interval between SSE comment frames sent on an otherwise idle stream.

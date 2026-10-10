@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use my_ai_agent::{json_schema::*, my_json};
+use json_schema::{my_json, *};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::mcp_middleware::{

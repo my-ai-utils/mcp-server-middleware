@@ -1,4 +1,4 @@
-use my_ai_agent::{json_schema::*, my_json};
+use json_schema::{my_json, *};
 use my_http_server::async_trait;
 
 use super::ToolCallContext;

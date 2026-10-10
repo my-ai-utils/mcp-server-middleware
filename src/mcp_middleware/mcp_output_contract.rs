@@ -1,5 +1,5 @@
 use super::*;
-use my_ai_agent::my_json::{
+use json_schema::my_json::{
     self,
     json_writer::{JsonObjectWriter, RawJsonObject},
 };

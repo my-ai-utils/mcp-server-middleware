@@ -1,3 +1,5 @@
+mod tool_definition;
+pub use tool_definition::*;
 mod connection_info;
 pub use connection_info::*;
 mod error_hook;

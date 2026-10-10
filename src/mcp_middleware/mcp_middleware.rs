@@ -18,7 +18,8 @@ use crate::mcp_middleware::{
     parse_elicitation_response,
 };
 
-use my_ai_agent::{ToolDefinition, json_schema::*};
+use crate::ToolDefinition;
+use json_schema::*;
 
 pub struct McpMiddleware {
     mcp_path: &'static str,
@@ -1140,7 +1141,7 @@ mod tests {
     use super::*;
     use crate::ToolDefinition;
     use crate::mcp_middleware::{McpSession, McpToolCall};
-    use my_ai_agent::json_schema::JsonTypeDescription;
+    use json_schema::JsonTypeDescription;
 
     #[derive(Debug, serde::Serialize, serde::Deserialize)]
     struct EchoInput {
@@ -1154,8 +1155,8 @@ mod tests {
             _has_default: bool,
             _with_enum: Option<Vec<rust_extensions::StrOrString<'static>>>,
             _output: bool,
-        ) -> my_ai_agent::my_json::json_writer::JsonObjectWriter {
-            my_ai_agent::my_json::json_writer::JsonObjectWriter::new().write("type", "object")
+        ) -> json_schema::my_json::json_writer::JsonObjectWriter {
+            json_schema::my_json::json_writer::JsonObjectWriter::new().write("type", "object")
         }
     }
 
@@ -1170,8 +1171,8 @@ mod tests {
             _has_default: bool,
             _with_enum: Option<Vec<rust_extensions::StrOrString<'static>>>,
             _output: bool,
-        ) -> my_ai_agent::my_json::json_writer::JsonObjectWriter {
-            my_ai_agent::my_json::json_writer::JsonObjectWriter::new().write("type", "object")
+        ) -> json_schema::my_json::json_writer::JsonObjectWriter {
+            json_schema::my_json::json_writer::JsonObjectWriter::new().write("type", "object")
         }
     }
 
@@ -1204,8 +1205,8 @@ mod tests {
             _has_default: bool,
             _with_enum: Option<Vec<rust_extensions::StrOrString<'static>>>,
             _output: bool,
-        ) -> my_ai_agent::my_json::json_writer::JsonObjectWriter {
-            my_ai_agent::my_json::json_writer::JsonObjectWriter::new()
+        ) -> json_schema::my_json::json_writer::JsonObjectWriter {
+            json_schema::my_json::json_writer::JsonObjectWriter::new()
                 .write("type", "object")
                 .write_json_object("properties", |properties| {
                     properties.write_json_object("pattern", |pattern| pattern.write("type", "string"))
@@ -1269,8 +1270,8 @@ mod tests {
             _has_default: bool,
             _with_enum: Option<Vec<rust_extensions::StrOrString<'static>>>,
             _output: bool,
-        ) -> my_ai_agent::my_json::json_writer::JsonObjectWriter {
-            my_ai_agent::my_json::json_writer::JsonObjectWriter::new().write("type", "object")
+        ) -> json_schema::my_json::json_writer::JsonObjectWriter {
+            json_schema::my_json::json_writer::JsonObjectWriter::new().write("type", "object")
         }
     }
 

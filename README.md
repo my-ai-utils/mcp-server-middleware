@@ -64,7 +64,7 @@ This middleware (`mcp-server-middleware`) is a **Rust library** that provides a 
 - `ResourceTemplateDefinition` & `McpResourceTemplateService`: Traits for resource templates — one handler serves every URI of one shape (`docs://lib/{topic}`)
 
 **Type Safety**:
-- Automatic JSON schema generation from Rust types using `ApplyJsonSchema` macro
+- Automatic JSON schema generation from Rust types using `ApplyJsonSchema` macro (from [json-schema](https://github.com/my-jet-tools/json-schema), re-exported by this crate)
 - Compile-time type checking ensures schemas match implementation
 - Support for dynamic enum values based on runtime data
 
@@ -99,7 +99,7 @@ This middleware (`mcp-server-middleware`) is a **Rust library** that provides a 
 * **Prompt Support**: Register and expose prompts that MCP clients can discover and use
 * **Resource Support**: Expose data sources (files, schemas, etc.) that clients can read for context
 * **HTTP Integration**: Seamless integration with `my-http-server` as middleware
-* **Type-Safe Tool Definitions**: Leverages `my-ai-agent` for type-safe JSON schema generation
+* **Type-Safe Tool Definitions**: Leverages [json-schema](https://github.com/my-jet-tools/json-schema) for type-safe JSON schema generation
 * **Dynamic Enumeration**: Support for dynamically generated enum values based on runtime data
 * **Elicitation** (server→client user input): tools that implement `McpToolCallEx` can request a value from the user mid-execution via `ToolCallContext::elicit()`. Requires the client to advertise `capabilities.elicitation` at initialize. Useful for credentials and confirmations that should never enter the LLM context.
 * **Session lifecycle events**: register an `McpConnectionInfo` hook to be told when a session appears (with the request that created it) and when it is gone — enough to keep a live "who is connected" list in the host.
@@ -113,12 +113,13 @@ Add the dependency to your `Cargo.toml`:
 [dependencies]
 mcp-server-middleware = { git = "https://github.com/my-ai-utils/mcp-server-middleware.git" }
 my-http-server = { tag = "0.8.3", git = "https://github.com/MyJetTools/my-http-server.git"}
-my-ai-agent = { tag = "0.1.0", git = "https://github.com/my-ai-utils/my-ai-agent.git", features = ["agent"] }
 tokio = { version = "*", features = ["full"] }
 serde = { version = "*", features = ["derive"] }
 serde_json = "*"
 async-trait = "*"
 ```
+
+No `json-schema` dependency is needed: [json-schema](https://github.com/my-jet-tools/json-schema) is re-exported as `mcp_server_middleware::json_schema`, together with an `ApplyJsonSchema` derive (`mcp_server_middleware::ApplyJsonSchema`) whose generated code refers to it through `mcp_server_middleware`.
 
 ## Quick Start
 
@@ -150,8 +151,7 @@ let mut mcp_middleware = McpMiddleware::new(
 Create a service that implements the `McpToolCall` trait:
 
 ```rust
-use mcp_server_middleware::{McpToolCall, ToolDefinition};
-use my_ai_agent::{macros::ApplyJsonSchema, json_schema::*};
+use mcp_server_middleware::{ApplyJsonSchema, McpToolCall, ToolDefinition, json_schema::*};
 use serde::{Deserialize, Serialize};
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -577,9 +577,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mcp_server_middleware::{
-    ElicitationAction, McpToolCallEx, ToolCallContext, ToolDefinition,
+    ApplyJsonSchema, ElicitationAction, McpToolCallEx, ToolCallContext, ToolDefinition,
 };
-use my_ai_agent::macros::ApplyJsonSchema;
 use serde::{Deserialize, Serialize};
 
 #[derive(ApplyJsonSchema, Debug, Serialize, Deserialize)]
@@ -740,9 +739,9 @@ For tool call parameters that need to accept values from a dynamically generated
 To use dynamic enums, specify the `enum` parameter in the `#[property]` attribute with the name of an async function that will generate the enum values. This function must return `Option<Vec<StrOrString<'static>>>` and will be called automatically when the MCP client requests the tool schema.
 
 ```rust
-use my_ai_agent::macros::ApplyJsonSchema;
+use mcp_server_middleware::ApplyJsonSchema;
+use mcp_server_middleware::json_schema::rust_extensions::StrOrString;
 use serde::{Deserialize, Serialize};
-use service_sdk::rust_extensions::StrOrString;
 
 #[derive(ApplyJsonSchema, Serialize, Deserialize, Debug)]
 pub struct FilterPropertiesToolCallModel {
@@ -928,9 +927,8 @@ The following example demonstrates a real-world implementation - a Postgres MCP 
 
 ```rust
 use std::sync::Arc;
-use mcp_server_middleware::{McpMiddleware, McpToolCall, ToolDefinition};
+use mcp_server_middleware::{ApplyJsonSchema, McpMiddleware, McpToolCall, ToolDefinition, json_schema::*};
 use my_http_server::MyHttpServer;
-use my_ai_agent::{macros::ApplyJsonSchema, json_schema::*};
 use serde::{Deserialize, Serialize};
 use async_trait::async_trait;
 use std::net::SocketAddr;
@@ -1499,7 +1497,7 @@ rather than holding an `McpSession` and expecting it to tick.
 
 ## Type Safety
 
-The middleware leverages `my-ai-agent`'s `ApplyJsonSchema` macro to automatically generate JSON schemas for your input and output types. This ensures type safety and automatic schema generation for MCP tool definitions. Use the `#[property(description = "...")]` attribute to document your fields:
+The middleware leverages the `ApplyJsonSchema` macro from [json-schema](https://github.com/my-jet-tools/json-schema) (re-exported as `mcp_server_middleware::ApplyJsonSchema`) to automatically generate JSON schemas for your input and output types. This ensures type safety and automatic schema generation for MCP tool definitions. Use the `#[property(description = "...")]` attribute to document your fields:
 
 ```rust
 #[derive(ApplyJsonSchema, Serialize, Deserialize)]
@@ -1757,7 +1755,7 @@ The Postgres example above demonstrates one such use case. You can adapt the sam
 ## Dependencies
 
 * `my-http-server`: HTTP server framework
-* `my-ai-agent`: AI agent utilities and JSON schema generation
+* [json-schema](https://github.com/my-jet-tools/json-schema): JSON schema generation (`ApplyJsonSchema` derive), re-exported as `mcp_server_middleware::json_schema`
 * `tokio`: Async runtime
 * `serde` / `serde_json`: Serialization
 * `async-trait`: Async trait support

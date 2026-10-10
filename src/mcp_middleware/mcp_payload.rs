@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use my_ai_agent::my_json::json_reader::{JsonFirstLineIterator, JsonValueRef};
-use my_ai_agent::my_json::json_writer::JsonValueWriter;
+use json_schema::my_json::json_reader::{JsonFirstLineIterator, JsonValueRef};
+use json_schema::my_json::json_writer::JsonValueWriter;
 use serde::{Deserialize, Serialize};
 
 /// JSON-RPC request id. Per the JSON-RPC 2.0 spec an id is a string, a

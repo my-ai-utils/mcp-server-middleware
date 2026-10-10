@@ -1,4 +1,4 @@
-use my_ai_agent::my_json;
+use json_schema::my_json;
 
 use super::*;
 use crate::mcp_middleware::ToolCallContext;
