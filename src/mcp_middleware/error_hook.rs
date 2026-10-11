@@ -128,9 +128,9 @@ pub enum McpMiddlewareError<'s> {
     /// is a client failing to open its SSE stream, a `DELETE` a client
     /// closing a session twice.
     ///
-    /// This one is debug info rather than an error, see
-    /// [`Self::is_debug_info`]: it is written to the console by a debug
-    /// build only.
+    /// This one is not shown in production, see
+    /// [`Self::show_in_production`]: a release build keeps it off the
+    /// console.
     SessionRejected {
         session_id: Option<&'s str>,
         http_method: &'s str,
@@ -166,19 +166,19 @@ impl<'s> McpMiddlewareError<'s> {
         }
     }
 
-    /// `true` for the events that are routine rather than errors — today
+    /// `false` for the events that are routine rather than errors — today
     /// that is [`Self::SessionRejected`]: a client showing up with a
     /// session the server no longer has (a restart, the idle GC), or with
     /// no session at all. In production that happens all the time and is
     /// fine: the client is answered `404`/`400` and starts over, and
     /// there is nothing to fix on this side.
     ///
-    /// The middleware writes these to the console in a debug build only —
-    /// a release build does not have that code at all. The host hook
-    /// still gets them, and can use this to file them apart from the
-    /// real errors or to drop them.
-    pub fn is_debug_info(&self) -> bool {
-        matches!(self, Self::SessionRejected { .. })
+    /// A release build (`--release`) does not write these to the console;
+    /// a debug build writes everything. The host hook gets them either
+    /// way, and can use this to file them apart from the real errors or
+    /// to drop them.
+    pub fn show_in_production(&self) -> bool {
+        !matches!(self, Self::SessionRejected { .. })
     }
 }
 
@@ -292,9 +292,9 @@ impl Display for McpMiddlewareError<'_> {
 /// plain `docker logs` still shows it. Registering a hook changes nothing
 /// about that.
 ///
-/// The hook sees more than the console does: the events that are
-/// [`McpMiddlewareError::is_debug_info`] reach stderr in a debug build
-/// only, and reach the hook always.
+/// The hook sees more than the console does: the events that are not
+/// [`McpMiddlewareError::show_in_production`] reach stderr in a debug
+/// build only, and reach the hook always.
 ///
 /// This is a pure observation hook. It can neither alter nor suppress a
 /// response: the error text sent to the client, the JSON-RPC codes and
@@ -333,9 +333,9 @@ impl McpErrorReporter {
         let _ = self.hook.set(hook);
     }
 
-    /// Reports `err` to both places: stderr — always for an error, in a
-    /// debug build only for debug info — and the host hook when one is
-    /// registered. The console line goes out first, so a slow or broken
+    /// Reports `err` to both places: stderr — in a release build only
+    /// when it is [`McpMiddlewareError::show_in_production`] — and the
+    /// host hook when one is registered. The console line goes out first, so a slow or broken
     /// hook can not delay or swallow it.
     pub(crate) async fn report(&self, err: McpMiddlewareError<'_>) {
         write_to_console(&err);
@@ -347,20 +347,14 @@ impl McpErrorReporter {
 }
 
 fn write_to_console(err: &McpMiddlewareError<'_>) {
-    if !err.is_debug_info() {
-        eprintln!(
-            "{} McpMiddleware error: {}",
-            DateTimeAsMicroseconds::now().to_rfc3339(),
-            err
-        );
+    // A debug build prints everything; a release build only what is worth
+    // seeing in production.
+    if !cfg!(debug_assertions) && !err.show_in_production() {
         return;
     }
 
-    // Debug info is routine in production, so a release build is not
-    // even compiled with the line below.
-    #[cfg(debug_assertions)]
     eprintln!(
-        "{} McpMiddleware debug: {}",
+        "{} McpMiddleware error: {}",
         DateTimeAsMicroseconds::now().to_rfc3339(),
         err
     );
@@ -457,15 +451,15 @@ mod tests {
 
     /// A refused session is routine, anything else is an error.
     #[test]
-    fn only_a_rejected_session_is_debug_info() {
-        assert!(session_rejected().is_debug_info());
-        assert!(!error().is_debug_info());
+    fn only_a_rejected_session_is_hidden_in_production() {
+        assert!(!session_rejected().show_in_production());
+        assert!(error().show_in_production());
     }
 
-    /// Keeping debug info off the console must not keep it from the host
-    /// — in a release build the hook is the only place it shows up.
+    /// Keeping an event off the production console must not keep it from
+    /// the host — in a release build the hook is the only place it shows up.
     #[tokio::test]
-    async fn the_hook_gets_debug_info() {
+    async fn the_hook_gets_events_hidden_in_production() {
         let reporter = McpErrorReporter::new();
         let recorder = Arc::new(Recorder {
             seen: parking_lot::Mutex::new(Vec::new()),

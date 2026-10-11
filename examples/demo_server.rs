@@ -291,8 +291,8 @@ impl McpConnectionInfo for DemoConnectionInfo {
 /// Every error the hook sees is also written to stderr by the middleware
 /// itself, so a manual run shows each error twice: once as
 /// `<date> McpMiddleware error: ...`, once as the line below. A refused
-/// session is debug info: the middleware writes it as
-/// `<date> McpMiddleware debug: ...`, and only in a debug build.
+/// session is not `show_in_production()`: a `--release` build keeps it
+/// off the console, so there only the line below shows it.
 pub struct DemoErrorHook;
 
 #[async_trait::async_trait]
