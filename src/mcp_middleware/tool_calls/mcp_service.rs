@@ -178,6 +178,7 @@ mod tests {
     fn test_ctx() -> ToolCallContext {
         ToolCallContext {
             session_id: "test".to_string(),
+            credentials_id: None,
             supports_elicitation: false,
             elicitations: Arc::new(McpElicitations::new()),
             sessions: Arc::new(McpSessions::new()),

@@ -11,6 +11,16 @@ use crate::mcp_middleware::{
 /// notably MCP elicitation (`elicitation/create`).
 pub struct ToolCallContext {
     pub session_id: String,
+    /// Who the request carrying this call came from: `get_id()` of the
+    /// [`my_http_server::RequestCredentials`] that an authentication
+    /// middleware registered in front of this one put into
+    /// `HttpContext::credentials`. `None` when nothing did — there is no
+    /// such middleware, or it let the request through unauthenticated.
+    ///
+    /// Taken from the request itself, not from the session: a session id
+    /// says which conversation this is, credentials say who is speaking
+    /// in it, and only the second one was checked by anybody.
+    pub credentials_id: Option<String>,
     pub supports_elicitation: bool,
     pub(crate) elicitations: Arc<McpElicitations>,
     pub(crate) sessions: Arc<McpSessions>,

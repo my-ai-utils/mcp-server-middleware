@@ -408,6 +408,7 @@ impl McpMiddleware {
         now: DateTimeAsMicroseconds,
         id: &RequestId,
         ctx: Option<&mut HttpContext>,
+        credentials_id: Option<String>,
     ) -> Result<HttpOkResult, HttpFailResult> {
         match data {
             super::McpInputData::Initialize(contract) => {
@@ -564,6 +565,7 @@ impl McpMiddleware {
 
                 let ctx = ToolCallContext {
                     session_id: session_id.to_string(),
+                    credentials_id,
                     supports_elicitation: self
                         .sessions
                         .session_supports_elicitation(session_id),
@@ -846,7 +848,24 @@ impl McpMiddleware {
         &self,
         session_id: Option<&str>,
         body: &[u8],
+        ctx: Option<&mut HttpContext>,
+    ) -> Result<HttpOkResult, HttpFailResult> {
+        let credentials_id = credentials_id_of(ctx.as_deref());
+
+        self.handle_post_request_from(session_id, body, ctx, credentials_id)
+            .await
+    }
+
+    /// [`Self::handle_post_request`] with the caller already read off the
+    /// request. Taken as a value rather than out of `ctx` because the
+    /// zero-copy path can not hand `ctx` over at all: the body it passes
+    /// in is a borrow of that very `HttpContext`.
+    async fn handle_post_request_from(
+        &self,
+        session_id: Option<&str>,
+        body: &[u8],
         mut ctx: Option<&mut HttpContext>,
+        credentials_id: Option<String>,
     ) -> Result<HttpOkResult, HttpFailResult> {
         let now = DateTimeAsMicroseconds::now();
 
@@ -938,9 +957,16 @@ impl McpMiddleware {
             }
         }
 
-        self.handle_authorized_request(session_id, data, now, &id, ctx)
+        self.handle_authorized_request(session_id, data, now, &id, ctx, credentials_id)
             .await
     }
+}
+
+/// Who an authentication middleware in front of this one said the request
+/// came from — `get_id()` of the credentials it left in `HttpContext`.
+fn credentials_id_of(ctx: Option<&HttpContext>) -> Option<String> {
+    ctx.and_then(|ctx| ctx.credentials.as_ref())
+        .map(|credentials| credentials.get_id().to_string())
 }
 
 fn accepted_response(now: DateTimeAsMicroseconds) -> Result<HttpOkResult, HttpFailResult> {
@@ -1078,6 +1104,10 @@ impl HttpServerMiddleware for McpMiddleware {
                     return Some(result);
                 }
 
+                // Read before the body is: from here on the body borrows
+                // `ctx`, and a tool still has to know who is calling it.
+                let credentials_id = credentials_id_of(Some(&*ctx));
+
                 let body = match ctx.request.get_body().await {
                     Ok(body) => body,
                     Err(err) => {
@@ -1088,7 +1118,12 @@ impl HttpServerMiddleware for McpMiddleware {
                 };
 
                 let result = self
-                    .handle_post_request(session_id.as_deref(), body.as_slice(), None)
+                    .handle_post_request_from(
+                        session_id.as_deref(),
+                        body.as_slice(),
+                        None,
+                        credentials_id,
+                    )
                     .await;
                 return Some(result);
             }

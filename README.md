@@ -102,6 +102,7 @@ This middleware (`mcp-server-middleware`) is a **Rust library** that provides a 
 * **Type-Safe Tool Definitions**: Leverages [json-schema](https://github.com/my-jet-tools/json-schema) for type-safe JSON schema generation
 * **Dynamic Enumeration**: Support for dynamically generated enum values based on runtime data
 * **Elicitation** (server→client user input): tools that implement `McpToolCallEx` can request a value from the user mid-execution via `ToolCallContext::elicit()`. Requires the client to advertise `capabilities.elicitation` at initialize. Useful for credentials and confirmations that should never enter the LLM context.
+* **Who is calling**: a tool that implements `McpToolCallEx` reads `ToolCallContext::credentials_id` — the id of the credentials an authentication middleware in front of this one left in `HttpContext::credentials` for that very request. The middleware authenticates nobody itself; an API key, a cookie or anything else is the host's to check. See [Knowing who is calling](#knowing-who-is-calling).
 * **Session lifecycle events**: register an `McpConnectionInfo` hook to be told when a session appears (with the request that created it) and when it is gone — enough to keep a live "who is connected" list in the host.
 * **Error reporting to the host**: every way a request can fail inside the middleware — bad arguments, failed or unknown tools, prompts and resources, unsupported methods, unparsable payloads, session refusals — is written to stderr with a timestamp, and handed to an optional `McpMiddlewareErrorHook` so a host can put it in its own activity console. Each event carries the session id. Session refusals are routine rather than errors (`show_in_production()` is `false`): a release build keeps them off the console, a debug build prints them.
 
@@ -662,8 +663,9 @@ mcp_middleware.register_tool_call_with_context(Arc::new(ConnectDbHandler));
 
 ```rust
 pub struct ToolCallContext {
-    pub session_id: String,         // mcp-session-id of the originating call
-    pub supports_elicitation: bool, // did the client advertise the capability?
+    pub session_id: String,             // mcp-session-id of the originating call
+    pub credentials_id: Option<String>, // who the request came from — see "Knowing who is calling"
+    pub supports_elicitation: bool,     // did the client advertise the capability?
     // ...plus internal handles to the elicitation registry and the SSE sender
 }
 
@@ -731,6 +733,56 @@ impl McpToolCallExWithInstruction<MyInput, MyOutput> for MyTool {
 ```
 
 Every `McpToolCallEx` implementor gets `McpToolCallExWithInstruction` for free through a blanket impl (with `instruction = None`), so existing tools keep working unchanged. `register_tool_call_with_context` accepts both.
+
+## Knowing who is calling
+
+The middleware authenticates nobody. Who is calling is decided where every other `my-http-server` service decides it: by a middleware registered **in front of** this one, which looks at the request — an API key, a cookie, a client certificate — and puts its verdict into `HttpContext::credentials`. That slot is my-http-server's own, so the server also writes the caller into its logs and telemetry as `client_id` without being asked.
+
+A context-aware tool then reads it as `ctx.credentials_id` — `get_id()` of those credentials:
+
+```rust
+use my_http_server::{HttpContext, HttpFailResult, HttpOkResult, HttpServerMiddleware, RequestClaim, RequestCredentials};
+
+struct ApiKeyCaller(String);
+
+impl RequestCredentials for ApiKeyCaller {
+    fn get_id(&self) -> &str {
+        &self.0 // what a tool will see in `ctx.credentials_id`
+    }
+
+    fn get_claims<'s>(&'s self) -> Option<Vec<RequestClaim<'s>>> {
+        None
+    }
+}
+
+struct ApiKeyAuthentication;
+
+#[async_trait::async_trait]
+impl HttpServerMiddleware for ApiKeyAuthentication {
+    async fn handle_request(&self, ctx: &mut HttpContext) -> Option<Result<HttpOkResult, HttpFailResult>> {
+        if !ctx.request.get_path().equals_to_case_insensitive("/mcp") {
+            return None;
+        }
+
+        match find_user_by_key(ctx) {
+            Some(user) => {
+                ctx.credentials = Some(Box::new(ApiKeyCaller(user)));
+                None // go on to the MCP middleware
+            }
+            None => Some(Err(HttpFailResult::as_unauthorized(Some("A valid API key is required")))),
+        }
+    }
+}
+
+// In a tool:
+let caller = ctx.credentials_id.as_deref().ok_or("This request came without credentials")?;
+
+// Registration: the authentication FIRST, the MCP middleware after it.
+http_server.add_middleware(Arc::new(ApiKeyAuthentication));
+http_server.add_middleware(Arc::new(mcp_middleware));
+```
+
+It is read **per request**, never per session: a session id only says which conversation a call belongs to, and anybody holding one could send a request on it. Two requests on one session with two different keys are two different callers, and a request that nothing vouched for has `None` — a tool that needs a caller refuses it rather than guessing.
 
 ## Dynamic Enum Fields
 
@@ -1231,13 +1283,15 @@ instruction on the context-aware path" above.
 ### `ToolCallContext`
 
 Built by the middleware per tool call and passed into
-`McpToolCallEx::execute_tool_call`. Exposes the session id, the
-client's `elicitation` capability flag, and the `elicit(...)` method
-documented in the "Server→client elicitation" section.
+`McpToolCallEx::execute_tool_call`. Exposes the session id, who the
+request came from (see "Knowing who is calling"), the client's
+`elicitation` capability flag, and the `elicit(...)` method documented
+in the "Server→client elicitation" section.
 
 ```rust
 pub struct ToolCallContext {
     pub session_id: String,
+    pub credentials_id: Option<String>,
     pub supports_elicitation: bool,
     // ...internal handles
 }

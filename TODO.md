@@ -34,7 +34,8 @@ What is still left to do in `mcp-server-middleware` so that a downstream service
 - [ ] **`Last-Event-ID` / resumability.** The spec lets a client reconnect and catch up on missed events. Not supported yet.
 - [ ] **`Mcp-Protocol-Version` header** — the client must send it with every request, and the server must validate compatibility.
 - [ ] **CORS / Origin validation** — for browser clients; mandatory per the transport spec.
-- [ ] **Authorization (OAuth 2.1)** — the MCP HTTP transport spec refers to a separate auth spec. Currently the only "auth" is the presence of `mcp-session-id`.
+- [ ] **Authorization (OAuth 2.1)** — the MCP HTTP transport spec refers to a separate auth spec. The middleware itself still checks nothing but the presence of `mcp-session-id`.
+- [x] **The caller, from the host's own authentication.** A middleware registered in front of this one puts its verdict into `HttpContext::credentials` (an API key, a cookie — the host's choice), and a context-aware tool reads it as `ToolCallContext::credentials_id`, per request. Details: README, "Knowing who is calling"; [tests/credentials.rs](tests/credentials.rs).
 
 ## Quality and infrastructure
 
